@@ -1,0 +1,5 @@
+pg_lzma_export
+*.o
+*.xz
+*.gz
+*.dSYM/
