@@ -7,3 +7,5 @@ state/
 *.partial
 qwen2.5-coder-14b-instruct-q4_k_m.gguf
 deploy/ser_ops.env
+deploy/mail-accounts.conf
+deploy/mail-rules.conf

@@ -1,0 +1,7 @@
+# name|imap-host|user|app-password|trash-folder   (copy to mail-accounts.conf — GITIGNORED)
+# gmail   -> imap.gmail.com          app pw: myaccount.google.com/apppasswords
+# yahoo   -> imap.mail.yahoo.com     app pw: account.yahoo.com -> Security -> app passwords
+# hotmail -> outlook.office365.com   basic auth may be OFF (OAuth2 needed if login fails)
+gmail|imap.gmail.com|you@gmail.com|PASTE_APP_PASSWORD|[Gmail]/Trash
+yahoo|imap.mail.yahoo.com|you@yahoo.com|PASTE_APP_PASSWORD|Bulk
+hotmail|outlook.office365.com|you@hotmail.com|PASTE_APP_PASSWORD|Deleted

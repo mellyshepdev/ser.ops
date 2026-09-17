@@ -291,3 +291,14 @@ Adding a task = one line in `TASKS` (`name|min-interval-min|lockfile|cmd`)
 - Linear: BLA-18 (mariadb secret-file bug), BLA-19 (broken `liv-log-pgdb-18.3`),
   BLA-21 (version-control `db-backup.sh`), BLA-30 (incremental export),
   BLA-31 (unit7 capacity).
+
+## `mail-ops.sh` — inbox sweep (rotation `mail` task, ~hourly)
+
+Scans IMAP inboxes, archives every new message to unit3 **before** any
+action, applies `deploy/mail-rules.conf` (glob → keep|trash — trash =
+provider trash folder, recoverable ~30d, never hard-delete), and posts a
+digest of new arrivals as a Linear comment on `LINEAR_MAIL_ISSUE` (BLA-70).
+
+Accounts live in `deploy/mail-accounts.conf` (gitignored — app passwords):
+`name|imap-host|user|app-pw|trash-folder`. Gmail/Yahoo need app passwords;
+Hotmail may need OAuth2 if basic auth is disabled on the account.

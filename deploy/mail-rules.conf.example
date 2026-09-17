@@ -1,0 +1,7 @@
+# <match-glob>|<action>   first match wins; text tested against "from subject"
+# actions: keep (leave in inbox) | trash (move to provider trash folder)
+*newsletter*|trash
+*noreply@*|trash
+*@linkedin.com*|trash
+*@facebookmail.com*|trash
+*receipt*|keep

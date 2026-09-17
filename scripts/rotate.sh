@@ -36,6 +36,7 @@ TASKS=(
   "vol-2|110|$VOL_LOCK|env SHARD=2/3 MAX_MOUNT_MB=8192 KEEP_DAYS=14 $SCRIPTS/backup-volumes.sh"
   "vol-big|1320|$VOL_LOCK|env MIN_MOUNT_MB=8192 KEEP_DAYS=14 $SCRIPTS/backup-volumes.sh"
   "db|350|$DB_LOCK|env LOCK=$DB_LOCK $SCRIPTS/backup-dbs.sh"
+  "mail|55|$STATE_DIR/mail.lock|env LOCK=$STATE_DIR/mail.lock $SCRIPTS/mail-ops.sh"
 )
 
 mkdir -p "$ROTATE_DIR"
