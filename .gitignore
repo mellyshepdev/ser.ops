@@ -3,3 +3,7 @@ pg_lzma_export
 *.xz
 *.gz
 *.dSYM/
+state/
+*.partial
+qwen2.5-coder-14b-instruct-q4_k_m.gguf
+deploy/ser_ops.env

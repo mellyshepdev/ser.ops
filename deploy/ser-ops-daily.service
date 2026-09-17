@@ -1,0 +1,11 @@
+[Unit]
+Description=Server Ops Daily Security Audit & Escalation Loop
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ser_ops_daily_loop.sh
+EnvironmentFile=/etc/ser_ops/.env
+
+[Install]
+WantedBy=multi-user.target

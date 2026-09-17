@@ -1,0 +1,8 @@
+# Minimal runtime for pg_lzma_export on the live-logger-db docker network.
+# Build once on the unit: docker build -f Dockerfile.runtime -t ser.ops-export .
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpq5 liblzma5 ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+COPY pg_lzma_export /usr/local/bin/pg_lzma_export
+ENTRYPOINT ["/usr/local/bin/pg_lzma_export"]
