@@ -251,6 +251,28 @@ doubled. If nothing is eligible the tick exits quietly.
 | `export` | 55 min | incremental `logs_archive` xz export → unit3 |
 | `vol-0/1/2` | 110 min | volume shards — containers hash-split into thirds, mounts ≤8 GB; full small-mount coverage ~6 h; orphan volumes ride `vol-2` |
 | `vol-big` | 22 h | mounts >8 GB (the pgdata whales) — ~daily so they don't drag every tick |
+| `db` | ~6 h | logical dumps of every DB container → unit3 (`backup-dbs.sh`) |
+
+## `backup-dbs.sh` — logical DB dumps
+
+Volume tars are crash-consistent; these are the clean restore points.
+Auto-detects DB containers by image and dumps per engine, compressed,
+streamed to `unit3:~/backups/db/<host>/<yyyymmdd>/` (local fallback at
+`~/backups/db/`):
+
+- **postgres** — `pg_dump -Fc` per database (compressed custom format) +
+  `pg_dumpall -g` for roles; superuser read from `POSTGRES_USER`
+- **mariadb/mysql** — `mariadb-dump --single-transaction` per schema, root
+  pw read from `MARIADB_ROOT_PASSWORD`/`MYSQL_ROOT_PASSWORD`
+- **redis** — `redis-cli --rdb` snapshot, **masters only** (replicas hold
+  the same data; sentinels have none); auth from `REDISCLI_AUTH`/`REDIS_PASSWORD`
+- **cockroach** — `BACKUP INTO nodelocal://`, tarred out; skipped (with a
+  manifest note) if the license rejects it — volume tar remains the fallback
+
+Stopped containers are skipped (volume archives still cover their data).
+Each run ships a `manifest-<stamp>.txt` (`container|engine|db|status`) and
+reports failures through locator events. `ONLY_DBS="name ..."` restricts a
+run to specific containers — handy for single-DB refreshes.
 
 Volume tasks run with `KEEP_DAYS=14` (30d of daily ~60 GB sets would
 overrun unit3's disk). Sharding is `SHARD=i/n`; size gates

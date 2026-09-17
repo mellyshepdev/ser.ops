@@ -23,6 +23,7 @@ LOCATOR_URL_DEFAULT="https://locator.theofficialblacksheepco.online"
 
 VOL_LOCK="$STATE_DIR/backup-volumes.lock"
 EXP_LOCK="$STATE_DIR/export.lock"
+DB_LOCK="$STATE_DIR/backup-dbs.lock"
 
 # Small mounts rotate through 3 shards (~every 2h each → full coverage ~6h).
 # Mounts >8GB are the "big" task (~daily) — pgdata whales don't drag ticks.
@@ -34,6 +35,7 @@ TASKS=(
   "vol-1|110|$VOL_LOCK|env SHARD=1/3 MAX_MOUNT_MB=8192 KEEP_DAYS=14 $SCRIPTS/backup-volumes.sh"
   "vol-2|110|$VOL_LOCK|env SHARD=2/3 MAX_MOUNT_MB=8192 KEEP_DAYS=14 $SCRIPTS/backup-volumes.sh"
   "vol-big|1320|$VOL_LOCK|env MIN_MOUNT_MB=8192 KEEP_DAYS=14 $SCRIPTS/backup-volumes.sh"
+  "db|350|$DB_LOCK|env LOCK=$DB_LOCK $SCRIPTS/backup-dbs.sh"
 )
 
 mkdir -p "$ROTATE_DIR"
