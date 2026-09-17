@@ -125,6 +125,144 @@ Compares the tool against the existing `gzip -9` pipeline on real data at
 several presets, and shows the incremental-vs-full delta. Run it on the host
 holding the database.
 
+## Ops on unit7
+
+All ser.ops work runs through the rotation dispatcher — see `rotate.sh`
+below. The incremental `logs_archive` export (live-logger-db) is rotation
+task `export` (~hourly):
+
+```sh
+# one-shot
+/home/swoopg111/projects/ser.ops/scripts/export-archive.sh
+```
+
+- Binary: `pg_lzma_export` (build via Debian container if host lacks `gcc`/`libpq-dev`)
+- Runtime image: `ser.ops-export:latest` (`Dockerfile.runtime`)
+- Output: `/home/swoopg111/backups/ser.ops/`
+- Watermark: `state/logs_archive.watermark` (advanced only after `xz -t`)
+- Events: locator `/api/events` as `ser.ops` / `ser.ops-warn` / `ser.ops-failed`
+  (auth via `X-Locator-Admin-Key` from lokey's `.env`)
+- Off-box copy tries `BACKUP_HOST` (default `unit9-mesh`); if SSH fails the
+  file stays local and a **warn** event is raised — never silent.
+
+## `backup-volumes.sh`
+
+Per-container attached-volume backup, added after the unit8 loss proved that
+configs-in-git is not enough — mailbox data, gitea repos, app state all lived
+only in docker volumes that went down with the host.
+
+For every container (running **or** stopped), every attached mount — named
+volume or bind — is tarred read-only through a throwaway
+`debian:bookworm-slim` helper container and **streamed straight to the backup
+host over ssh**. Nothing stages on local disk, so the ~46 GB database dirs
+can ship without touching unit7's 82%-full root.
+
+```sh
+# full sweep, on demand (normally run by the rotation — see below)
+/home/swoopg111/projects/ser.ops/scripts/backup-volumes.sh
+
+# targeted run — one service's state
+ONLY_CONTAINERS="hub-postgres welcome" \
+  /home/swoopg111/projects/ser.ops/scripts/backup-volumes.sh
+```
+
+- Destination: `unit3-tailscale:~/backups/volumes/<unit>/<yyyymmdd>/`
+  (`BACKUP_HOST`, `REMOTE_DIR` overridable)
+- Naming: `<container>__<dest-path|vol-name>__<stamp>.tar.gz`
+- Manifest: `manifest-<stamp>.txt` ships with each run — pipe-separated
+  `container|type|source|dest|archive|status`. It's the restore index.
+- Orphans: named volumes not attached to any container are still archived
+  (as `_unattached`) — deleted containers don't take their data with them.
+- Shared volumes are archived once (first container seen wins; the rest are
+  recorded in the manifest as `skip-shared-via-*`).
+- Events: locator `/api/events` as `ser.ops` / `ser.ops-warn`.
+
+### If the backup host is down
+
+Falls back to local `~/backups/volumes/<stamp>/` — but **only for mounts ≤
+`LOCAL_FALLBACK_MAX_MB` (4 GB)**. Bigger mounts are recorded as
+`SKIP-oversize-no-remote` rather than eating the disk, and the run exits
+nonzero so the warn event fires.
+
+### Exclusions
+
+Source paths matching `EXCLUDE_PATTERNS` (plus optional
+`volume-backup-excludes.txt`, one regex per line) are never archived:
+
+- `/` — lokey mounts the host root at `/host`; without this the "backup"
+  would tar the entire box
+- `/var/log`, `/var/lib/docker/containers`, `/var/run/docker.sock` —
+  host logs, engine internals, the socket itself
+- `/proc`, `/sys`, `/dev`, `/etc/{os-release,timezone,localtime}`
+
+Note: `/var/lib/docker/volumes` is **not** excluded — that is where named
+volume mountpoints live; it's most of what we're here for.
+
+### Retention
+
+Remote sets older than `KEEP_DAYS` (30) are pruned from the backup host each
+run; local staging thins after `KEEP_LOCAL_DAYS` (7).
+
+### Restore
+
+```sh
+# find the archive in the manifest
+grep 'mycontainer' manifest-*.txt
+
+# named volume — recreate, then untar into it
+docker volume create myvol
+scp unit3-tailscale:backups/volumes/unit7/<stamp>/<archive>.tar.gz .
+docker run --rm -v myvol:/data -v "$PWD:/in" debian:bookworm-slim \
+    sh -c 'tar -xzf /in/<archive>.tar.gz -C /data'
+
+# bind mount — untar back over the recorded source path
+tar -xzf <archive>.tar.gz -C /recorded/source/path
+```
+
+### Consistency, and the secrets caveat
+
+These are **crash-consistent filesystem copies** — a live postgres data dir
+tarred mid-write may not be a clean restore point. The pg_dump/mysqldump
+jobs stay the clean-restore path for databases; this script is the
+everything-else safety net (and a better-than-nothing for DBs).
+
+Archives are plaintext tar.gz and some binds contain secrets (`.ssh`,
+`secrets/`, `bao.token`). Access to the backup host is the trust boundary —
+keep unit3's account locked down.
+
+## `rotate.sh` — task rotation
+
+ser.ops runs on a rotation, not fixed per-job crons. Cron ticks the
+dispatcher every 30 min; each tick runs **exactly one** due task and
+advances the round-robin pointer — it switches tasks every 30–60 min.
+
+```sh
+# cron (installed on unit7)
+*/30 * * * * /home/swoopg111/projects/ser.ops/scripts/rotate.sh \
+  >>/home/swoopg111/backups/ser.ops/rotate.log 2>&1
+```
+
+A task is eligible only when its min-interval has elapsed **and** its own
+lockfile is free — a task still mid-flight is skipped, never queued or
+doubled. If nothing is eligible the tick exits quietly.
+
+| Task | Interval | What it does |
+| --- | --- | --- |
+| `export` | 55 min | incremental `logs_archive` xz export → unit3 |
+| `vol-0/1/2` | 110 min | volume shards — containers hash-split into thirds, mounts ≤8 GB; full small-mount coverage ~6 h; orphan volumes ride `vol-2` |
+| `vol-big` | 22 h | mounts >8 GB (the pgdata whales) — ~daily so they don't drag every tick |
+
+Volume tasks run with `KEEP_DAYS=14` (30d of daily ~60 GB sets would
+overrun unit3's disk). Sharding is `SHARD=i/n`; size gates
+`MIN_MOUNT_MB`/`MAX_MOUNT_MB` use a 12 h `du` cache in
+`state/volume-sizes.cache` so a 46 GB data dir isn't re-scanned every tick.
+
+State lives in `state/rotate/`: `index` (round-robin pointer),
+`<task>.last` (last attempt mtime), `rotate.lock`.
+
+Adding a task = one line in `TASKS` (`name|min-interval-min|lockfile|cmd`)
+— give it its own lockfile or share one to mutual-exclude with another job.
+
 ## Related
 
 - `NOTES.md` — original design notes and scratch code.
