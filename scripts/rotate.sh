@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 # ser.ops task rotation dispatcher.
 #
-# Cron ticks every 30 min; each tick runs exactly ONE due task, then the
-# round-robin pointer advances — ser.ops "switches tasks" every 30–60 min
-# instead of every job firing on its own fixed schedule.
+# THE MODEL: one job per SLOT, worked for up to a full slot (1 hour by
+# default), then the pointer moves to the next job. deploy/tick.sh owns the
+# slot clock and exports SEROPS_DEADLINE; this script picks who gets the slot.
+#
+# SOFT DEADLINE: SEROPS_DEADLINE (epoch seconds) is inherited by the task
+# command. A task that works in chunks should finish the chunk it is on,
+# decline to START another past the deadline, then exit 0. Tasks that ignore
+# it run to completion as before — overrunning a slot is tolerated, the next
+# slot just starts late. Nothing had to be rewritten for this to be safe.
 #
 # A task is eligible when BOTH:
 #   - its min-interval has elapsed since its last attempt (state/rotate/*.last)
 #   - its own lockfile is free (a still-running task is skipped, not queued)
 # If nothing is eligible the tick exits quietly — that's normal.
+#
+# NOTE ON INTERVALS: with N tasks at one hour each a full cycle already takes
+# N hours, so any min-interval below N*60 never actually gates anything. The
+# short values below (55, 110) are inherited from when this ran every 30 min
+# and are kept only so a task cannot double-run if the slot length is lowered.
 #
 # Task table: name|min-interval-min|task-lockfile|command
 set -uo pipefail
@@ -51,6 +62,13 @@ TASKS=(
   # only ever write locally. Daily (1440) — these are leftovers, not a
   # hot path, and a tick spent here is a tick not spent on volumes.
   "sweep-backups|1440|$STATE_DIR/sweep-backups.lock|$SCRIPTS/sweep-backups.sh"
+  # live-logger tiered rollover (hot->warm->unit3). Replaces the standalone
+  # `17 * * * * ~/live-logger-db/rollover.sh` cron line, which archived the
+  # entire backlog in one unbatched statement, wedged for 6+ hours holding its
+  # lock, and let logs_warm reach 45GB/77.7M rows. 60min so the 6h hot window
+  # drains steadily; heavy, so loadguard gets to defer it — the old cron had no
+  # such brake and kept firing straight into the 2026-09-20 load-47 pile-up.
+  "livlog|60|$STATE_DIR/livlog-rollover.lock|$SCRIPTS/livlog-rollover.sh"
 )
 
 mkdir -p "$ROTATE_DIR"
@@ -166,9 +184,17 @@ if [ -r "$SCRIPTS/loadguard.sh" ]; then
     fi
 fi
 
-log "task $name start (rotation slot $picked/$((n-1)))"
+# Budget the task actually has. Reported so a slow job can be told apart from
+# a job that was simply handed a short remainder of a slot.
+budget=""
+if [ -n "${SEROPS_DEADLINE:-}" ]; then
+    budget=$(( SEROPS_DEADLINE - $(date +%s) ))
+    [ "$budget" -lt 0 ] && budget=0
+fi
+
+log "task $name start (rotation slot $picked/$((n-1))${budget:+, ${budget}s of slot left})"
 event "$name" start "rotation slot $picked/$((n-1))" "" "" \
-    "$(detail_kv slot="$picked" interval_min="$interval")"
+    "$(detail_kv slot="$picked" interval_min="$interval" budget_s="${budget:-unset}")"
 
 # Mark the attempt BEFORE running, not after. Touching .last post-run made the
 # interval clock measure time since COMPLETION, so the longer a task ran the

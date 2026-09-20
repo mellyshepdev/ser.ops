@@ -30,7 +30,13 @@ services:
       UNIT_NAME: "${UNIT_NAME:-unit7}"
       REPO: /srv/ser.ops
       STATE_DIR: /srv/ser.ops/state
-      TICK_SECONDS: "${TICK_SECONDS:-1800}"
+      # One job per SLOT, worked for up to the whole slot, then the pointer
+      # moves on. An hour is the intended cadence. SLOT_SECONDS is the knob;
+      # TICK_SECONDS is kept only so an older override still resolves, and is
+      # now a fallback rather than the default — leaving it at 1800 is what
+      # kept the dispatcher on 30-minute slots after the rewrite.
+      SLOT_SECONDS: "${SLOT_SECONDS:-3600}"
+      TICK_SECONDS: "${TICK_SECONDS:-3600}"
       # ssh looks up the key path under $HOME; without this it would try
       # /nonexistent for an unknown uid and every transfer would fail.
       HOME: /home/swoopg111
