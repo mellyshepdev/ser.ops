@@ -45,6 +45,12 @@ TASKS=(
   # volume-archive pile without a multi-hour monolith copy; once drained the
   # task no-ops until something new lands in the archive.
   "archive-offload|120|$STATE_DIR/archive-offload.lock|$SCRIPTS/archive-offload.sh"
+  # Same fleet rule, the other half: ~/backups on the production box
+  # itself. backup-dbs.sh stages there whenever unit3 is unreachable and
+  # nothing ever collected the fallback; the inventory and locator jobs
+  # only ever write locally. Daily (1440) — these are leftovers, not a
+  # hot path, and a tick spent here is a tick not spent on volumes.
+  "sweep-backups|1440|$STATE_DIR/sweep-backups.lock|$SCRIPTS/sweep-backups.sh"
 )
 
 mkdir -p "$ROTATE_DIR"

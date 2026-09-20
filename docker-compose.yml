@@ -1,0 +1,65 @@
+# ser.ops as a container.
+#
+# The scripts are bind-mounted rather than baked into the image, so shipping a
+# task change is `git pull` with no rebuild, and state/ (rotate pointers, task
+# locks, event stream) survives a recreate.
+#
+# Cutover note: the host's `*/30 * * * * rotate.sh` cron entry must be removed
+# when this starts, or two dispatchers advance the same round-robin pointer.
+# The task locks prevent overlapping runs, not double-dispatch.
+services:
+  ser-ops:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ser.ops:latest
+    container_name: ser-ops
+    restart: unless-stopped
+    init: true
+
+    # Runs as the host's swoopg111 (1001:1001), not root, for two reasons:
+    # ssh refuses to use a private key it does not own, and anything the tasks
+    # write keeps the same ownership it had before containerising.
+    user: "1001:1001"
+    # ...but the docker socket is root:docker, so the container needs that
+    # supplementary group. 986 is `getent group docker` on unit7.
+    group_add:
+      - "986"
+
+    environment:
+      UNIT_NAME: "${UNIT_NAME:-unit7}"
+      REPO: /srv/ser.ops
+      STATE_DIR: /srv/ser.ops/state
+      TICK_SECONDS: "${TICK_SECONDS:-1800}"
+      # ssh looks up the key path under $HOME; without this it would try
+      # /nonexistent for an unknown uid and every transfer would fail.
+      HOME: /home/swoopg111
+
+    env_file:
+      # Webhook URLs + Linear key. Untracked on purpose; absent on a fresh
+      # clone, which must not stop the stack from coming up.
+      - path: ./deploy/ser_ops.env
+        required: false
+
+    volumes:
+      # Tasks dump sibling containers via `docker exec`, so they need the
+      # host daemon. This is the whole reason the image ships the docker CLI.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Scripts, lib/, state/ — the deploy surface.
+      - .:/srv/ser.ops
+      # What sweep-backups drains, and where backup-dbs stages its fallback
+      # when unit3 is unreachable.
+      - /home/swoopg111/backups:/home/swoopg111/backups
+      # Identity + known_hosts for the unit3 transfers. Read-only: the tasks
+      # need to authenticate, never to rewrite credentials.
+      - /home/swoopg111/.ssh:/home/swoopg111/.ssh:ro
+      # The cold volume-archive that archive-offload.sh drains one dir per run.
+      - /home/swoopg111/mnt/xvdbz1/volume-archive:/home/swoopg111/mnt/xvdbz1/volume-archive
+
+    working_dir: /srv/ser.ops
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
