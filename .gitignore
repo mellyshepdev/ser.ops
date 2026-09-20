@@ -9,3 +9,7 @@ qwen2.5-coder-14b-instruct-q4_k_m.gguf
 deploy/ser_ops.env
 deploy/mail-accounts.conf
 deploy/mail-rules.conf
+
+# Python bytecode (build artifact, never commit)
+__pycache__/
+*.pyc
