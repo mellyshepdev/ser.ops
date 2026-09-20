@@ -150,6 +150,22 @@ if [ "$picked" -lt 0 ]; then
 fi
 
 IFS='|' read -r name interval lock cmd <<< "${TASKS[$picked]}"
+
+# Load guard — decide whether the box can afford this task before starting it.
+# Encodes the judgement that used to require a human ("should voldb run while
+# cockroach is thrashing?"). Exit 75 means defer: the interval is NOT consumed,
+# but the rotation pointer DOES advance, so a held-back heavy task lets the
+# next task have the slot instead of monopolising every tick.
+if [ -r "$SCRIPTS/loadguard.sh" ]; then
+    RUN_ID="$RUN_ID" bash "$SCRIPTS/loadguard.sh" "$name"
+    guard_rc=$?
+    if [ "$guard_rc" -eq 75 ]; then
+        log "task $name held back by loadguard — interval not consumed, pointer advanced"
+        echo "$picked" > "$IDX_FILE"
+        exit 0
+    fi
+fi
+
 log "task $name start (rotation slot $picked/$((n-1)))"
 event "$name" start "rotation slot $picked/$((n-1))" "" "" \
     "$(detail_kv slot="$picked" interval_min="$interval")"
