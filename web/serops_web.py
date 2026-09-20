@@ -310,7 +310,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    os.makedirs(EVENT_DIR, exist_ok=True)
+    # The repo may be mounted read-only in the container — the dashboard only
+    # ever reads. Never let a failed mkdir stop it from serving.
+    try:
+        os.makedirs(EVENT_DIR, exist_ok=True)
+    except OSError:
+        pass
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     srv.daemon_threads = True
     print(f"ser.ops dashboard on http://{BIND}:{PORT}/  events={EVENT_DIR}", flush=True)

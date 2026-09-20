@@ -63,3 +63,40 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # Transparency dashboard over the JSONL event stream lib/event.sh writes.
+  # Separate service, not a second process in ser-ops: the dispatcher image is
+  # docker:28-cli + coreutils and has no Python, and a crash-looping web server
+  # must never be able to take the backup dispatcher down with it.
+  ser-ops-web:
+    image: python:3.12-alpine
+    container_name: ser-ops-web
+    restart: unless-stopped
+    init: true
+    user: "1001:1001"
+
+    # Read-only: the dashboard only ever reads the event stream, the rotate
+    # pointers, and rotate.sh (it parses the TASKS table so /api/health cannot
+    # drift from the real schedule).
+    volumes:
+      - .:/srv/ser.ops:ro
+
+    environment:
+      REPO: /srv/ser.ops
+      STATE_DIR: /srv/ser.ops/state
+      # Bind all interfaces INSIDE the container; the published port below is
+      # what restricts exposure to the tailnet address on the host.
+      SEROPS_BIND: "0.0.0.0"
+      SEROPS_PORT: "8137"
+
+    # Tailnet only. unit7 has no public web exposure and must not gain one.
+    ports:
+      - "100.99.131.20:8137:8137"
+
+    command: ["python3", "/srv/ser.ops/web/serops_web.py"]
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
