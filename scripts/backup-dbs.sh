@@ -162,18 +162,42 @@ for line in $containers; do
   log "$name: BACKUP into nodelocal"
   if docker exec "$name" cockroach sql --insecure \
       -e "BACKUP INTO 'nodelocal://1/serops-$STAMP'" >/dev/null 2>&1; then
-    docker exec "$name" tar czf - -C /cockroach/cockroach-data/extern "serops-$STAMP" 2>/dev/null \
-      > /tmp/crdb-$$.tar.gz \
-      && { if [ $REMOTE_OK -eq 1 ]; then
-             cat /tmp/crdb-$$.tar.gz | ssh $SSH_OPTS "$REMOTE_HOST" \
-               "cat > ~/$REMOTE_DIR/${name}-backup-${STAMP}.tar.gz" \
-               && manifest "$name" cockroach cluster ok || { manifest "$name" cockroach cluster FAIL-ship; fails=$((fails+1)); }
-           else
-             mv /tmp/crdb-$$.tar.gz "$LOCAL_DIR/${name}-backup-${STAMP}.tar.gz" \
-               && manifest "$name" cockroach cluster ok
-           fi; } \
-      || { manifest "$name" cockroach cluster FAIL-tar; fails=$((fails+1)); }
-    rm -f /tmp/crdb-$$.tar.gz
+    # Stream the backup set out WITHOUT staging it whole.
+    #
+    # This used to land in /tmp/crdb-$$.tar.gz first. On unit7 /tmp is a
+    # tmpfs — RAM, not disk — and this tarball is 5.8 GB. On 2026-09-20 the
+    # 00:47 run squeezed through while memory was free and the 08:00 run hit
+    # FAIL-tar with only 4.0 GB MemAvailable against a 5.8 GB write. Staging a
+    # multi-GB database backup through RAM on a 15 GB box with no swap cannot
+    # be made reliable; the fix is to not stage it.
+    #
+    # Remote: pipe tar straight into ssh, so nothing large touches this box.
+    # Local:  write straight to disk (/ has ~94 GB free), never tmpfs.
+    # Both verify with `gzip -t` before the final rename, and leave a
+    # .partial behind on failure rather than a truncated "good" archive —
+    # same contract archive-offload.sh uses.
+    crdb_ok=0
+    if [ $REMOTE_OK -eq 1 ]; then
+      rp="~/$REMOTE_DIR/${name}-backup-${STAMP}.tar.gz"
+      if docker exec "$name" tar czf - -C /cockroach/cockroach-data/extern "serops-$STAMP" 2>/dev/null \
+           | ssh $SSH_OPTS "$REMOTE_HOST" \
+               "cat > $rp.partial && gzip -t $rp.partial && mv $rp.partial $rp"; then
+        crdb_ok=1
+      else
+        manifest "$name" cockroach cluster FAIL-ship; fails=$((fails+1))
+      fi
+    else
+      mkdir -p "$LOCAL_DIR"
+      lp="$LOCAL_DIR/${name}-backup-${STAMP}.tar.gz"
+      if docker exec "$name" tar czf - -C /cockroach/cockroach-data/extern "serops-$STAMP" 2>/dev/null \
+           > "$lp.partial" && gzip -t "$lp.partial" && mv "$lp.partial" "$lp"; then
+        crdb_ok=1
+      else
+        rm -f "$lp.partial"
+        manifest "$name" cockroach cluster FAIL-tar; fails=$((fails+1))
+      fi
+    fi
+    [ $crdb_ok -eq 1 ] && manifest "$name" cockroach cluster ok
     docker exec "$name" rm -rf "/cockroach/cockroach-data/extern/serops-$STAMP" >/dev/null 2>&1
   else
     log "$name: BACKUP failed (license?) — volume tar remains the fallback"
