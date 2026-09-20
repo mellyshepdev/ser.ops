@@ -1,4 +1,5 @@
 pg_lzma_export
+bin/
 *.o
 *.xz
 *.gz
