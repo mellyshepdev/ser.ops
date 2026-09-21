@@ -27,6 +27,22 @@ RUN apk add --no-cache \
       python3 \
       tzdata
 
+# compose pins `user: "1001:1001"` to match the host's swoopg111, but the base
+# image has no passwd entry for that uid. OpenSSH refuses to start without one
+# ("No user exists for uid 1001"), so EVERY ssh out of this container failed --
+# which the backup script reported as "unit3-tailscale unreachable" and quietly
+# downgraded to a local-disk fallback. The result was remote=0 on every run:
+# backups of unit7 stored on unit7. /etc/passwd is root-owned, so the container
+# cannot repair this at runtime; the entry has to be baked in here.
+#
+# getent guards both lines so the build still works if a future base image
+# happens to ship a 1001 already.
+RUN set -eux; \
+    getent group  1001 >/dev/null || addgroup -g 1001 swoopg111; \
+    getent passwd 1001 >/dev/null || adduser -D -u 1001 \
+        -G "$(getent group 1001 | cut -d: -f1)" \
+        -h /home/swoopg111 -s /bin/bash swoopg111
+
 ENV REPO=/srv/ser.ops \
     STATE_DIR=/srv/ser.ops/state
 
