@@ -6,7 +6,7 @@ library ONLY — unit7's sudo needs a password, so nothing can be pip-installed.
 
 Contract: .claude/skills/serops-webui/SKILL.md
 """
-import json, os, re, time, threading, html
+import json, os, re, time, threading, html, fcntl
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -57,19 +57,112 @@ def read_events(date=None, since=None, task=None, phase=None, limit=None):
     return out[-limit:] if limit else out
 
 
-def task_table():
-    """Parse the TASKS array out of rotate.sh so health reflects the real
-    schedule rather than a copy that drifts."""
-    tasks = {}
+def task_list():
+    """Ordered TASKS rows from rotate.sh: (name, interval_min, lockfile).
+    Reads the same table rotate.sh dispatches from, in declaration order,
+    so 'next task' mirrors the real rotation instead of a copy that drifts.
+    $STATE_DIR and the three X_LOCK vars are resolved to real paths."""
+    rows = []
+    vars_ = {}
     try:
         with open(ROTATE_SH, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                m = re.match(r'\s*"([a-z0-9-]+)\|(\d+)\|', line)
+                v = re.match(r'\s*([A-Z_]+_LOCK)="\$STATE_DIR/([^"]+)"', line)
+                if v:
+                    vars_[v.group(1)] = os.path.join(STATE_DIR, v.group(2))
+                m = re.match(r'\s*"([a-z0-9-]+)\|(\d+)\|([^|]+)\|', line)
                 if m:
-                    tasks[m.group(1)] = int(m.group(2))
+                    lock = m.group(3).strip().replace("$STATE_DIR", STATE_DIR)
+                    for k, p in vars_.items():
+                        lock = lock.replace(f"${k}", p)
+                    rows.append((m.group(1), int(m.group(2)), lock))
     except OSError:
         pass
-    return tasks
+    return rows
+
+
+def task_table():
+    """Parse the TASKS array out of rotate.sh so health reflects the real
+    schedule rather than a copy that drifts."""
+    return {name: interval for name, interval, _ in task_list()}
+
+
+def lock_held(path):
+    """Same probe as rotate.sh lock_free(): a fresh flock on the file fails
+    while a live process holds it. Read-only open — the mount may be ro."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def current_run():
+    """The in-flight dispatch: a (run_id, task) with a start event but no
+    terminal done/fail/skip. Scan-phase skips share the run_id but carry a
+    different task name, so they must not close the started task's run.
+    Yesterday's file is included — a task can span the UTC rollover."""
+    open_runs = {}
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    for date in (yesterday, today()):
+        for ev in read_events(date):
+            key = (ev.get("run_id"), ev.get("task"))
+            ph = ev.get("phase")
+            if ph == "start":
+                open_runs[key] = ev
+            elif ph in ("done", "fail", "skip"):
+                open_runs.pop(key, None)
+            elif ph == "step" and key in open_runs:
+                open_runs[key]["_step"] = ev.get("msg")
+    if not open_runs:
+        return None
+    ev = max(open_runs.values(), key=lambda e: e.get("ts", ""))
+    try:
+        start = datetime.strptime(ev["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        elapsed = int(time.time() - start.timestamp())
+    except (KeyError, ValueError):
+        elapsed = None
+    return {
+        "task": ev.get("task"), "run_id": ev.get("run_id"),
+        "start_ts": ev.get("ts"), "elapsed_s": elapsed,
+        "step": ev.get("_step"), "msg": ev.get("msg"),
+    }
+
+
+def next_task():
+    """Predict what the next tick picks — the same scan rotate.sh runs:
+    from index+1, first task due (age >= interval) with a free lock."""
+    rows = task_list()
+    n = len(rows)
+    if not n:
+        return None
+    try:
+        with open(os.path.join(ROTATE_DIR, "index"), "r") as fh:
+            idx = int(fh.read().strip())
+    except (OSError, ValueError):
+        idx = -1
+    now = time.time()
+    for k in range(1, n + 1):
+        i = (idx + k) % n
+        name, interval, lock = rows[i]
+        try:
+            age = now - os.path.getmtime(os.path.join(ROTATE_DIR, f"{name}.last"))
+        except OSError:
+            age = float("inf")
+        if age < interval * 60:
+            continue
+        if lock and lock_held(lock):
+            continue
+        return {"task": name, "slot": i, "interval_min": interval}
+    return None
 
 
 def summary(date=None):
@@ -125,6 +218,8 @@ def health():
         })
     return {
         "unit": "unit7", "date": today(), "generated": datetime.now(timezone.utc).isoformat(),
+        "server_now": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "current": current_run(), "next": next_task(),
         "ticks_today": ticks,
         "wasted_ticks": len([e for e in skips if (e.get("detail") or {}).get("reason") in ("lock_held", "none_free")]),
         "skip_reasons": reasons,
@@ -165,23 +260,53 @@ th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase}
 .ts{color:var(--faint)}.det{color:var(--faint);font-size:11px}
 #live{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--faint);margin-right:6px}
 #live.on{background:var(--green)}
+.nowbox{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+.nowbox .cell{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+padding:12px 16px;flex:1 1 160px}
+.nowbox .l{color:var(--dim);font-size:11px;text-transform:uppercase;margin-bottom:4px}
+.nowbox .v{font-size:18px;font-weight:700;color:var(--cyan)}
+.nowbox .clock .v{font-size:26px;color:var(--amber);font-variant-numeric:tabular-nums}
+.nowbox .sub2{color:var(--faint);font-size:11px;margin-top:3px}
 </style></head><body>
 <h1>ser.ops — unit7</h1>
 <div class="sub"><span id="live"></span><span id="livetxt">connecting…</span> · event file <span id="ef"></span></div>
 <div class="cards" id="cards"></div>
 <div class="wrap"><table id="tasks"><thead><tr><th>task</th><th>interval</th><th>last dispatch</th>
 <th>age</th><th>done</th><th>fail</th><th>skip</th><th>median</th><th></th></tr></thead><tbody></tbody></table></div>
+<div class="nowbox">
+  <div class="cell"><div class="l">current task</div><div class="v" id="cur-task">—</div>
+    <div class="sub2" id="cur-step"></div></div>
+  <div class="cell clock"><div class="l">on current task</div><div class="v" id="cur-clock">--:--:--</div>
+    <div class="sub2" id="cur-since"></div></div>
+  <div class="cell"><div class="l">next task</div><div class="v" id="next-task">—</div>
+    <div class="sub2" id="next-det"></div></div>
+</div>
 <h1 style="font-size:13px">activity</h1>
 <div class="sub">grouped by run — newest first</div>
 <div id="runs"></div>
 <script>
 const $=s=>document.querySelector(s);
-let events=[], lastTs='';
+let events=[], lastTs='', curStart=null, clockSkew=0, ticker=null;
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function card(l,n,cls){return `<div class="card ${cls||''}"><div class="n">${n}</div><div class="l">${l}</div></div>`}
+function fmtDur(s){s=Math.max(0,Math.floor(s));
+  const h=String(Math.floor(s/3600)).padStart(2,'0'),m=String(Math.floor(s/60)%60).padStart(2,'0'),x=String(s%60).padStart(2,'0');
+  return `${h}:${m}:${x}`}
+function tickClock(){
+  $('#cur-clock').textContent=curStart==null?'--:--:--':fmtDur((Date.now()+clockSkew-curStart)/1000);
+}
 async function health(){
   const h=await (await fetch('api/health')).json();
   $('#ef').textContent=h.event_file;
+  clockSkew=h.server_now?Date.parse(h.server_now)-Date.now():0;
+  curStart=h.current?Date.parse(h.current.start_ts):null;
+  $('#cur-task').textContent=h.current?h.current.task:'idle';
+  $('#cur-step').textContent=h.current?(h.current.step||h.current.msg||''):'no task running';
+  $('#cur-since').textContent=h.current?('since '+h.current.start_ts):'';
+  $('#next-task').textContent=h.next?h.next.task:'—';
+  $('#next-det').textContent=h.next?('slot '+h.next.slot+' · '+h.next.interval_min+'m interval'):'nothing due';
+  if(!ticker)ticker=setInterval(tickClock,1000);
+  tickClock();
   const waste=h.ticks_today?Math.round(100*h.wasted_ticks/h.ticks_today):0;
   $('#cards').innerHTML=
     card('ticks today',h.ticks_today)+
