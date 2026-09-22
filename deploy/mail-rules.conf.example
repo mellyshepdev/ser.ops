@@ -36,3 +36,19 @@ subject:invoice|keep
 subject:Invoice|keep
 subject:order|keep
 subject:Order|keep
+
+# ── Carried over from the previous mail-rules.conf.example ────────────
+# These were the rules already in the repo. The old format had no
+# from:/subject: prefix — a bare glob tested against "from subject" together.
+# That still works: a pattern with no colon falls through to the combined
+# haystack, so these behave exactly as they did. Left commented, as they were
+# effectively never running (there was no mail-rules.conf for them to be in).
+# *newsletter*|trash
+# *noreply@*|trash
+# *@linkedin.com*|trash
+# *@facebookmail.com*|trash
+#
+# NOTE: the old file listed *receipt*|keep AFTER the trash rules, where
+# first-match-wins meant it could never save a receipt that had already
+# matched one. Keeps belong above trashes — see the keep block at the top.
+# *receipt*|keep
