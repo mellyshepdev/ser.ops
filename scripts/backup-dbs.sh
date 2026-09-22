@@ -34,11 +34,16 @@ else
   log "WARN remote $REMOTE_HOST unreachable — staging locally at $LOCAL_DIR"
 fi
 
+# Staging lives on disk, not tmpfs: /tmp is RAM on this box and a single
+# multi-GB dump through it is how the 08:00 run died on 2026-09-20.
+STAGE_DIR="$HOME/backups/db/.staging"
+mkdir -p "$STAGE_DIR"
+
 # ship <archive-name> — reads a byte stream on stdin, gzip's it, lands it
 # on unit3 (or local fallback). One retry on transient ssh drops.
 ship(){
   local name=$1 tmp ok=0 i
-  tmp=$(mktemp)
+  tmp=$(mktemp -p "$STAGE_DIR")
   gzip -1 > "$tmp" || { rm -f "$tmp"; return 1; }
   for i in 1 2; do
     if [ $REMOTE_OK -eq 1 ]; then
@@ -62,6 +67,19 @@ emit_event(){
     >/dev/null 2>&1 || true
 }
 
+# When the remote is down every run stages ~30G of dumps on /. If the disk
+# is already tight, another full staging round can fill it — that's the same
+# disk-full that killed pgdb-18.3 on 2026-09-18. Skip rather than pile up.
+if [ $REMOTE_OK -eq 0 ]; then
+  free_mb=$(df -Pm "$LOCAL_DIR" | awk 'NR==2{print $4}')
+  if [ "${free_mb:-0}" -lt "${MIN_FREE_MB:-20480}" ]; then
+    log "remote down AND ${free_mb}MB free < ${MIN_FREE_MB:-20480}MB — skipping to protect disk"
+    emit_event warn "backup-dbs skipped: unit3 unreachable, ${free_mb}MB free on /"
+    rm -f "$MANIFEST"
+    exit 1
+  fi
+fi
+
 containers=$(docker ps -a --format '{{.Names}}|{{.Image}}' 2>/dev/null)
 # Optional filter: ONLY_DBS="hub-postgres mariadb-11.4" (space-sep names)
 if [ -n "${ONLY_DBS:-}" ]; then
@@ -76,7 +94,7 @@ fails=0
 # ---------- postgres ----------
 for line in $containers; do
   name=${line%%|*}; img=${line##*|}
-  case "$img" in postgres*|*postgres*) ;; *) continue;; esac
+  case "$img" in postgres*|*postgres*|*pgvector*|*pg-autofailover*) ;; *) continue;; esac
   st=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)
   if [ "$st" != "true" ]; then manifest "$name" postgres - SKIP-stopped; continue; fi
 
@@ -211,6 +229,23 @@ cp "$MANIFEST" "$mf"
 [ $REMOTE_OK -eq 1 ] && cat "$MANIFEST" | ssh $SSH_OPTS "$REMOTE_HOST" \
   "cat > ~/$REMOTE_DIR/manifest-$STAMP.txt" 2>/dev/null
 rm -f "$MANIFEST"
+
+# ---------- flush locally-staged days ----------
+# Runs that found unit3 unreachable staged their dumps under
+# $HOME/backups/db/<day>/. Nothing else ever pushes those — once the remote
+# is back, rsync every pending day up and remove the local copy.
+if [ $REMOTE_OK -eq 1 ]; then
+  for d in "$HOME"/backups/db/*/; do
+    [ -d "$d" ] || continue
+    day=$(basename "$d")
+    if rsync -a --timeout=120 -e "ssh $SSH_OPTS" "$d" \
+        "$REMOTE_HOST:backups/db/${HOST_TAG}/" 2>/dev/null; then
+      rm -rf "$d" && log "flushed staged day $day -> unit3"
+    else
+      log "WARN flush of $day failed — left in place"
+    fi
+  done
+fi
 
 if [ $fails -gt 0 ]; then
   emit_event warn "backup-dbs finished with $fails failure(s) — see manifest $STAMP"
