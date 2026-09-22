@@ -160,6 +160,22 @@ else
     echo "[WARN] LOCATOR_AI_KEY not set in $ENV_FILE - fleet capacity check skipped."
 fi
 
+# ------------------------------------------------------------------------------
+# STEP 4: Config File Vault (config_files DB on comms-db)
+# ------------------------------------------------------------------------------
+# Copies config files from every reachable unit into config_files.files so a
+# dead unit no longer takes its bind-mounted configs (homeserver.yaml, .env,
+# postfix-accounts.cf, ...) with it. unit8 proved the need on 2026-09-17.
+echo "--> Running STEP 4: Config File Vault..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIGS_SCRIPT="${CONFIG_BACKUP_SCRIPT:-/usr/local/bin/backup-configs.sh}"
+[ -f "$CONFIGS_SCRIPT" ] || CONFIGS_SCRIPT="$SCRIPT_DIR/../scripts/backup-configs.sh"
+if [ -x "$CONFIGS_SCRIPT" ] || [ -f "$CONFIGS_SCRIPT" ]; then
+    bash "$CONFIGS_SCRIPT" || dispatch_webhook_alert "WARNING" "Config vault run failed" "backup-configs.sh exited non-zero; check /var/log/ser_ops/daily_loop.log"
+else
+    echo "[WARN] $CONFIGS_SCRIPT not found - config vault skipped."
+fi
+
 echo "======================================================================"
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ser.ops Daily Loop Finished."
 echo "======================================================================"

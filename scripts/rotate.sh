@@ -51,7 +51,15 @@ TASKS=(
   # tarballs remain the primary off-box copy.
   "voldb|300|$STATE_DIR/voldb.lock|$SCRIPTS/backup-volumes-db.sh"
   "db|350|$DB_LOCK|env LOCK=$DB_LOCK $SCRIPTS/backup-dbs.sh"
-  "mail|55|$STATE_DIR/mail.lock|env LOCK=$STATE_DIR/mail.lock $SCRIPTS/mail-ops.sh"
+  # IMAP_INSECURE=1 because the reech mailbox is reached at unit2's VPC
+  # address (172.31.3.133:143) rather than by name: unit9's mail edge
+  # cannot currently connect to its unit2 backend, so mail.theofficial-
+  # blacksheepco.com is not a usable route. The connection is still
+  # STARTTLS-encrypted; only the hostname check is skipped, which a
+  # certificate for the name can never satisfy when dialled by IP.
+  # Drop this the moment the edge is repaired and the host field can go
+  # back to the real name.
+  "mail|55|$STATE_DIR/mail.lock|env LOCK=$STATE_DIR/mail.lock IMAP_INSECURE=1 $SCRIPTS/mail-ops.sh"
   # Fleet rule: archives live on unit3. One dir per run drains the xvdbz1
   # volume-archive pile without a multi-hour monolith copy; once drained the
   # task no-ops until something new lands in the archive.
