@@ -54,14 +54,42 @@ fi
 LINEAR_KEY=${LINEAR_API_KEY:-}
 LINEAR_ISSUE_ID=${LINEAR_MAIL_ISSUE:-}
 
+# The host field used to be pasted straight into "imaps://$1/INBOX", which
+# pinned every account to implicit TLS on 993. That does not reach the house
+# mailboxes: unit9's mail edge cannot currently connect to the unit2 backend
+# (haproxy logs the attempt as 1/-1/... sC), and dovecot refuses a plaintext
+# LOGIN on 143, which curl reports as the very unhelpful "Login denied".
+#
+# So the host field now decides the transport:
+#   host                -> imaps://host        implicit TLS, 993 (Gmail etc.)
+#   host:143            -> imap://host:143     upgraded with STARTTLS
+#   imap[s]://host:port -> used verbatim
+#
+# --ssl asks for a STARTTLS upgrade where one is offered and is a no-op on an
+# already-encrypted imaps:// connection, so it is safe on every branch.
+imap_url(){
+  case "$1" in
+    *://*) printf '%s' "$1" ;;
+    *:143) printf 'imap://%s' "$1" ;;
+    *)     printf 'imaps://%s' "$1" ;;
+  esac
+}
+
+# Set IMAP_INSECURE=1 for a backend addressed by IP, whose certificate cannot
+# match the hostname. It is still encrypted — only the name check is skipped.
+IMAP_INSECURE=${IMAP_INSECURE:-0}
+curl_tls(){ [ "$IMAP_INSECURE" = 1 ] && printf -- '--ssl -k' || printf -- '--ssl'; }
+
 imap(){ # host user pass command -> stdout
-  curl -s --connect-timeout 15 --max-time 60 \
-    --user "$2:$3" "imaps://$1/INBOX" -X "$4" 2>/dev/null
+  # shellcheck disable=SC2046  # curl_tls is deliberately word-split
+  curl -s --connect-timeout 15 --max-time 60 $(curl_tls) \
+    --user "$2:$3" "$(imap_url "$1")/INBOX" -X "$4" 2>/dev/null
 }
 
 fetch_msg(){ # host user pass uid -> RFC822 on stdout
-  curl -s --connect-timeout 15 --max-time 120 \
-    --user "$2:$3" "imaps://$1/INBOX;UID=$4" 2>/dev/null
+  # shellcheck disable=SC2046
+  curl -s --connect-timeout 15 --max-time 120 $(curl_tls) \
+    --user "$2:$3" "$(imap_url "$1")/INBOX;UID=$4" 2>/dev/null
 }
 
 # SQL string literal — same quoting helper as backup-volumes-db.sh.
@@ -183,8 +211,11 @@ while IFS='|' read -r name host user pass trashfld; do
 
   # UIDs of unseen mail, minus ones we've already processed
   total_accts=$((total_accts+1))
+  # IMAP speaks CRLF. Without the \r strip the last token off "* SEARCH 1"
+  # is "1\r", which fails ^[0-9]+$ — so this found zero UIDs on every run and
+  # reported "nothing new" no matter how full the mailbox was.
   uids=$(imap "$host" "$user" "$pass" "UID SEARCH UNSEEN" \
-    | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | while read -r u; do
+    | tr -d '\r' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | while read -r u; do
         already_seen "$name" "$u" "$seen_file" || echo "$u"
       done)
   [ -z "$uids" ] && { log "$name: nothing new"; continue; }
