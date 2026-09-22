@@ -1,7 +1,41 @@
-# name|imap-host|user|app-password|trash-folder   (copy to mail-accounts.conf — GITIGNORED)
-# gmail   -> imap.gmail.com          app pw: myaccount.google.com/apppasswords
-# yahoo   -> imap.mail.yahoo.com     app pw: account.yahoo.com -> Security -> app passwords
-# hotmail -> outlook.office365.com   basic auth may be OFF (OAuth2 needed if login fails)
-gmail|imap.gmail.com|you@gmail.com|PASTE_APP_PASSWORD|[Gmail]/Trash
-yahoo|imap.mail.yahoo.com|you@yahoo.com|PASTE_APP_PASSWORD|Bulk
-hotmail|outlook.office365.com|you@hotmail.com|PASTE_APP_PASSWORD|Deleted
+# ser.ops mail accounts — copy to mail-accounts.conf and fill in the passwords.
+#
+#   name|imap-host|username|password|trash-folder
+#
+# mail-accounts.conf is GITIGNORED. This .example file is committed; the real
+# one must never be. Check `git check-ignore -v deploy/mail-accounts.conf`
+# before your first commit after editing.
+#
+# The three entries below are the mailboxes that actually exist on unit2's
+# docker-mailserver (`docker exec mailserver setup email list`). Passwords are
+# blank on purpose — mail-ops.sh skips any row with an empty password and logs
+# "no password configured", so this file is safe to copy as-is and fill in one
+# mailbox at a time.
+#
+# Those mailbox passwords are already stored, sealed with AES-256-GCM, in
+# Reech's mail_accounts table (see projects/reech/.env on unit2). They are
+# recoverable through Reech rather than by reading the database directly.
+#
+# unit9 is the MX edge and unit2 is the mailbox store; IMAP is reached through
+# the haproxy on unit9 that proxies 143/993 to unit2, which is why the host
+# below is the mail hostname and not unit2's address.
+
+# ── House mailboxes (unit2 / docker-mailserver) ───────────────────────
+reech|mail.theofficialblacksheepco.com|reech@theofficialblacksheepco.com||Trash
+support|mail.theofficialblacksheepco.com|support@puff-base.com||Trash
+swoopg111|mail.theofficialblacksheepco.com|swoopg111@puff-base.com||Trash
+
+# ── External providers ────────────────────────────────────────────────
+# These host/trash-folder pairs and the auth notes were in the original
+# version of this file; keeping them because they are the fiddly part.
+#
+#   gmail   -> imap.gmail.com         app pw: myaccount.google.com/apppasswords
+#   yahoo   -> imap.mail.yahoo.com    app pw: account.yahoo.com -> Security -> app passwords
+#   hotmail -> outlook.office365.com  basic auth may be OFF (OAuth2 needed if login fails)
+#
+# Note the trash folder differs per provider — Gmail wants the literal
+# "[Gmail]/Trash", Yahoo uses "Bulk", Outlook uses "Deleted".
+#
+# gmail|imap.gmail.com|blackshepherddeveloper@gmail.com|PASTE_APP_PASSWORD|[Gmail]/Trash
+# yahoo|imap.mail.yahoo.com|you@yahoo.com|PASTE_APP_PASSWORD|Bulk
+# hotmail|outlook.office365.com|you@hotmail.com|PASTE_APP_PASSWORD|Deleted
