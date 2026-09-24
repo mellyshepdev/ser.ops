@@ -59,6 +59,9 @@ services:
       # Identity + known_hosts for the unit3 transfers. Read-only: the tasks
       # need to authenticate, never to rewrite credentials.
       - /home/swoopg111/.ssh:/home/swoopg111/.ssh:ro
+      # livlog-rollover mounts this into a throwaway psql container for the
+      # unit3 archive hop; without it the task fails "missing ~/.pgpass".
+      - /home/swoopg111/.pgpass:/home/swoopg111/.pgpass:ro
       # The cold volume-archive that archive-offload.sh drains one dir per run.
       - /home/swoopg111/mnt/xvdbz1/volume-archive:/home/swoopg111/mnt/xvdbz1/volume-archive
 
