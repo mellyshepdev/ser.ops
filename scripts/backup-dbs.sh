@@ -3,10 +3,12 @@
 # compressed, streamed to unit3. Volume tars are crash-consistent; these
 # are the clean restore points.
 #
-# Engines: postgres (pg_dump -Fc per db + pg_dumpall -g roles),
-# mariadb/mysql (mariadb-dump --single-transaction per db), redis
-# (BGSAVE rdb copy, masters only), cockroach (BACKUP into nodelocal,
-# tarred out). Unknown/failed DBs are marked in the manifest, not fatal.
+# Engines: postgres (pg_dump -Fc per db + pg_dumpall -g roles; DBs over
+# BIG_DB_BYTES get schema+small-tables as one -Fc and each oversized table
+# as resumable timestamp-window COPY chunks), mariadb/mysql (mariadb-dump
+# --single-transaction per db), redis (BGSAVE rdb copy, masters only),
+# cockroach (BACKUP into nodelocal, tarred out). Unknown/failed DBs are
+# marked in the manifest, not fatal.
 #
 # Remote: unit3:~/backups/db/<host>/<yyyymmdd>/. Local fallback if the
 # remote is unreachable. Nothing large stages on this disk.
@@ -67,6 +69,121 @@ emit_event(){
     >/dev/null 2>&1 || true
 }
 
+# ---------- oversized postgres DBs ----------
+# A DB over BIG_DB_BYTES as a single pg_dump stream can hold the rotation
+# for many hours — the 101 GiB live_logger DB on comms-db ran ~12h on
+# 2026-09-25 and would every day. Chunked model instead, matching the
+# rotation's soft deadline: schema + tables <= BIG_TABLE_BYTES go as a
+# normal -Fc pair, and each oversized table is COPY'd in CHUNK_SECONDS
+# windows over its timestamp column. A bookmark per (container,db,table)
+# in CHUNK_STATE_DIR resumes where the last run stopped — half now, half
+# later. Once caught up only new rows dump; the CHUNK_LAG_SECONDS buffer
+# lets rollovers (livlog moves 6h-old rows logs -> logs_warm) settle first.
+# .copy files are plain COPY text — restore with COPY tbl FROM STDIN.
+BIG_DB_BYTES=${BIG_DB_BYTES:-8589934592}        # 8 GiB
+BIG_TABLE_BYTES=${BIG_TABLE_BYTES:-4294967296}  # 4 GiB
+CHUNK_SECONDS=${CHUNK_SECONDS:-21600}           # 6h windows
+CHUNK_LAG_SECONDS=${CHUNK_LAG_SECONDS:-86400}   # 24h settle window
+MAX_CHUNKS_PER_RUN=${MAX_CHUNKS_PER_RUN:-4}
+CHUNK_STATE_DIR=${CHUNK_STATE_DIR:-${STATE_DIR:-$HOME/backups/db}/chunks}
+mkdir -p "$CHUNK_STATE_DIR"
+
+psqlq(){ docker exec "$1" psql -U "$2" -d "$3" -Atc "$4" 2>/dev/null; }
+
+# dump_chunked_table <container> <db> <pguser> <table>
+dump_chunked_table(){
+  local cname=$1 db=$2 puser=$3 tbl=$4
+  local col bk start end_iso horizon label has n=0
+  col=$(psqlq "$cname" "$puser" "$db" \
+    "SELECT column_name FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='$tbl'
+        AND data_type LIKE 'timestamp%'
+        AND column_name IN ('received_at','event_time','created_at')
+      ORDER BY CASE column_name WHEN 'received_at' THEN 0
+                                WHEN 'event_time'  THEN 1 ELSE 2 END LIMIT 1")
+  if [ -z "$col" ]; then
+    log "$cname: $db.$tbl has no time column — whole-table dump"
+    docker exec "$cname" pg_dump -U "$puser" -Fc --data-only -t "$tbl" "$db" 2>/dev/null \
+      | ship "${cname}-${db}-${tbl}-${STAMP}.dump" \
+      && manifest "$cname" postgres "$db.$tbl" ok \
+      || { manifest "$cname" postgres "$db.$tbl" FAIL; fails=$((fails+1)); }
+    return
+  fi
+  bk="$CHUNK_STATE_DIR/${cname}__${db}__${tbl}.bookmark"
+  start=$(cat "$bk" 2>/dev/null || true)
+  if [ -z "$start" ]; then
+    start=$(psqlq "$cname" "$puser" "$db" \
+      "SELECT to_char(min($col),'YYYY-MM-DD HH24:MI:SS+00') FROM $tbl")
+    if [ -z "$start" ]; then
+      manifest "$cname" postgres "$db.$tbl" SKIP-empty; return
+    fi
+    # one-time NULL-time slice so COPY coverage is complete
+    docker exec "$cname" psql -U "$puser" -d "$db" -c \
+      "COPY (SELECT * FROM $tbl WHERE $col IS NULL) TO STDOUT" 2>/dev/null \
+      | ship "${cname}-${db}-${tbl}-null-${STAMP}.copy" \
+      && manifest "$cname" postgres "$db.$tbl[null]" ok \
+      || { manifest "$cname" postgres "$db.$tbl[null]" FAIL; fails=$((fails+1)); }
+  fi
+  horizon=$(psqlq "$cname" "$puser" "$db" \
+    "SELECT to_char(now()-interval '${CHUNK_LAG_SECONDS} seconds','YYYY-MM-DD HH24:MI:SS+00')")
+  while :; do
+    # ISO text compares chronologically — cheap string guards
+    [ ! "$start" \< "$horizon" ] && break
+    end_iso=$(psqlq "$cname" "$puser" "$db" \
+      "SELECT to_char('$start'::timestamptz+interval '${CHUNK_SECONDS} seconds','YYYY-MM-DD HH24:MI:SS+00')")
+    [ "$end_iso" \> "$horizon" ] && end_iso=$horizon
+    has=$(psqlq "$cname" "$puser" "$db" \
+      "SELECT 1 FROM $tbl WHERE $col >= '$start'::timestamptz AND $col < '$end_iso'::timestamptz LIMIT 1")
+    if [ -z "$has" ]; then
+      echo "$end_iso" > "$bk.tmp" && mv "$bk.tmp" "$bk"; start=$end_iso; continue
+    fi
+    label=$(date -d "$start" +%Y%m%dT%H 2>/dev/null || echo "$start" | tr ' :' '__')
+    log "$cname: $db.$tbl chunk [$start -> $end_iso)"
+    docker exec "$cname" psql -U "$puser" -d "$db" -c \
+      "COPY (SELECT * FROM $tbl WHERE $col >= '$start'::timestamptz AND $col < '$end_iso'::timestamptz ORDER BY $col) TO STDOUT" 2>/dev/null \
+      | ship "${cname}-${db}-${tbl}-${label}-${STAMP}.copy" \
+      && manifest "$cname" postgres "$db.$tbl[$start..$end_iso)" ok \
+      || { manifest "$cname" postgres "$db.$tbl[$start..$end_iso)" FAIL; fails=$((fails+1)); break; }
+    echo "$end_iso" > "$bk.tmp" && mv "$bk.tmp" "$bk"
+    start=$end_iso
+    n=$((n+1))
+    if [ "$n" -ge "$MAX_CHUNKS_PER_RUN" ]; then
+      log "$cname: $db.$tbl chunk cap ($MAX_CHUNKS_PER_RUN) — resumes next run"
+      break
+    fi
+    if [ -n "${SEROPS_DEADLINE:-}" ] && [ "$(date +%s)" -ge "$((SEROPS_DEADLINE-120))" ]; then
+      log "$cname: $db.$tbl deadline hit after $n chunk(s) — resumes next run"
+      break
+    fi
+  done
+  [ "$n" -gt 0 ] && emit_event info "backup-dbs: $db.$tbl advanced $n chunk(s) to $start"
+}
+
+# dump_big_db <container> <db> <pguser>
+dump_big_db(){
+  local cname=$1 db=$2 puser=$3 t excl=""
+  local big_tables
+  big_tables=$(psqlq "$cname" "$puser" "$db" \
+    "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+      WHERE n.nspname='public' AND c.relkind='r'
+        AND pg_total_relation_size(c.oid) > ${BIG_TABLE_BYTES}
+      ORDER BY pg_total_relation_size(c.oid)")
+  log "$cname: $db oversized ($(psqlq "$cname" "$puser" "$db" \
+    "SELECT pg_size_pretty(pg_database_size('$db'))")) — chunked tables: ${big_tables:-none}"
+  docker exec "$cname" pg_dump -U "$puser" -Fc --schema-only "$db" 2>/dev/null \
+    | ship "${cname}-${db}-schema-${STAMP}.dump" \
+    && manifest "$cname" postgres "$db:schema" ok \
+    || { manifest "$cname" postgres "$db:schema" FAIL; fails=$((fails+1)); }
+  for t in $big_tables; do excl="$excl -T $t"; done
+  docker exec "$cname" pg_dump -U "$puser" -Fc --data-only $excl "$db" 2>/dev/null \
+    | ship "${cname}-${db}-smalltables-${STAMP}.dump" \
+    && manifest "$cname" postgres "$db:small-tables" ok \
+    || { manifest "$cname" postgres "$db:small-tables" FAIL; fails=$((fails+1)); }
+  for t in $big_tables; do
+    dump_chunked_table "$cname" "$db" "$puser" "$t"
+  done
+}
+
 # When the remote is down every run stages ~30G of dumps on /. If the disk
 # is already tight, another full staging round can fill it — that's the same
 # disk-full that killed pgdb-18.3 on 2026-09-18. Skip rather than pile up.
@@ -116,10 +233,15 @@ for line in $containers; do
 
   for db in $dbs; do
     log "$name: dumping $db"
-    docker exec "$name" pg_dump -U "$puser" -Fc "$db" 2>/dev/null \
-      | ship "${name}-${db}-${STAMP}.dump" \
-      && manifest "$name" postgres "$db" ok \
-      || { manifest "$name" postgres "$db" FAIL; fails=$((fails+1)); }
+    dbsz=$(psqlq "$name" "$puser" "$db" "SELECT pg_database_size('$db')")
+    if [ "${dbsz:-0}" -gt "$BIG_DB_BYTES" ]; then
+      dump_big_db "$name" "$db" "$puser"
+    else
+      docker exec "$name" pg_dump -U "$puser" -Fc "$db" 2>/dev/null \
+        | ship "${name}-${db}-${STAMP}.dump" \
+        && manifest "$name" postgres "$db" ok \
+        || { manifest "$name" postgres "$db" FAIL; fails=$((fails+1)); }
+    fi
   done
 done
 
