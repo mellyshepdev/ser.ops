@@ -220,7 +220,8 @@ for line in $containers; do
   [ -z "$puser" ] && puser=postgres
 
   dbs=$(docker exec "$name" psql -U "$puser" -d postgres -Atc \
-    "SELECT datname FROM pg_database WHERE datistemplate=false" 2>/dev/null)
+    "SELECT datname, pg_database_size(datname) FROM pg_database
+      WHERE datistemplate=false ORDER BY pg_database_size(datname)" 2>/dev/null)
   if [ -z "$dbs" ]; then
     log "$name: psql unreachable — SKIP"
     manifest "$name" postgres - FAIL-unreachable; fails=$((fails+1)); continue
@@ -231,9 +232,10 @@ for line in $containers; do
     && manifest "$name" postgres globals ok \
     || { manifest "$name" postgres globals FAIL; fails=$((fails+1)); }
 
-  for db in $dbs; do
+  # smallest first — cheap DBs always dump before the chunked giants
+  for line in $dbs; do
+    db=${line%%|*}; dbsz=${line##*|}
     log "$name: dumping $db"
-    dbsz=$(psqlq "$name" "$puser" "$db" "SELECT pg_database_size('$db')")
     if [ "${dbsz:-0}" -gt "$BIG_DB_BYTES" ]; then
       dump_big_db "$name" "$db" "$puser"
     else
@@ -260,9 +262,12 @@ for line in $containers; do
     manifest "$name" mariadb - FAIL-no-cred; fails=$((fails+1)); continue
   fi
 
+  # smallest first, same as postgres
   dbs=$(docker exec "$name" mariadb -u root "-p$pw" -Nse \
-    "SELECT schema_name FROM information_schema.schemata
-     WHERE schema_name NOT IN ('information_schema','performance_schema')" 2>/dev/null)
+    "SELECT table_schema, COALESCE(SUM(data_length+index_length),0)
+       FROM information_schema.tables
+      WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys')
+      GROUP BY table_schema ORDER BY 2" 2>/dev/null | awk '{print $1}')
   for db in $dbs; do
     log "$name: dumping $db"
     docker exec "$name" "$dumper" -u root "-p$pw" --single-transaction --routines --triggers "$db" 2>/dev/null \
