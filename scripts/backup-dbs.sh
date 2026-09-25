@@ -82,7 +82,7 @@ emit_event(){
 # .copy files are plain COPY text — restore with COPY tbl FROM STDIN.
 BIG_DB_BYTES=${BIG_DB_BYTES:-8589934592}        # 8 GiB
 BIG_TABLE_BYTES=${BIG_TABLE_BYTES:-4294967296}  # 4 GiB
-CHUNK_SECONDS=${CHUNK_SECONDS:-21600}           # 6h windows
+CHUNK_SECONDS=${CHUNK_SECONDS:-10800}           # 3h windows
 CHUNK_LAG_SECONDS=${CHUNK_LAG_SECONDS:-86400}   # 24h settle window
 MAX_CHUNKS_PER_RUN=${MAX_CHUNKS_PER_RUN:-4}
 CHUNK_STATE_DIR=${CHUNK_STATE_DIR:-${STATE_DIR:-$HOME/backups/db}/chunks}
