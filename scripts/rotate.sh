@@ -51,6 +51,13 @@ TASKS=(
   # tarballs remain the primary off-box copy.
   "voldb|300|$STATE_DIR/voldb.lock|$SCRIPTS/backup-volumes-db.sh"
   "db|350|$DB_LOCK|env LOCK=$DB_LOCK $SCRIPTS/backup-dbs.sh"
+  # Same dump logic, run ON unit2 and unit9 so their databases reach unit3 too.
+  # ser.ops only runs here, and backup-dbs.sh only enumerates LOCAL containers —
+  # so unit2 (the comms DB: members, contacts, mail accounts, calendar, and the
+  # portal's photos/preferences) and unit9 (PowerDNS zones) had never been
+  # backed up at all. 410 rather than 350 so the two heavy dump tasks drift
+  # apart instead of landing together.
+  "db-remote|410|$STATE_DIR/backup-remote.lock|env LOCK=$STATE_DIR/backup-remote.lock $SCRIPTS/backup-remote.sh"
   # IMAP_INSECURE=1 because the reech mailbox is reached at unit2's VPC
   # address (172.31.3.133:143) rather than by name: unit9's mail edge
   # cannot currently connect to its unit2 backend, so mail.theofficial-
