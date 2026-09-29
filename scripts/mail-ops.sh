@@ -215,8 +215,16 @@ while IFS='|' read -r name host user pass trashfld; do
   # IMAP speaks CRLF. Without the \r strip the last token off "* SEARCH 1"
   # is "1\r", which fails ^[0-9]+$ — so this found zero UIDs on every run and
   # reported "nothing new" no matter how full the mailbox was.
-  uids=$(imap "$host" "$user" "$pass" "UID SEARCH UNSEEN" \
-    | tr -d '\r' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | while read -r u; do
+  #
+  # Bound the search: a raw "UID SEARCH UNSEEN" on a Gmail inbox holding tens
+  # of thousands of unread messages makes Gmail silently drop the connection
+  # (verified: 43.5K unseen, server closes after the command). A rolling
+  # SINCE window keeps every sweep small; MAIL_MAX_UIDS caps worst case.
+  since=$(date -d "-${MAIL_SINCE_DAYS:-2} days" +%d-%b-%Y 2>/dev/null \
+    || date +%d-%b-%Y)
+  uids=$(imap "$host" "$user" "$pass" "UID SEARCH UNSEEN SINCE $since" \
+    | tr -d '\r' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n \
+    | tail -n "${MAIL_MAX_UIDS:-150}" | while read -r u; do
         already_seen "$name" "$u" "$seen_file" || echo "$u"
       done)
   [ -z "$uids" ] && { log "$name: nothing new"; continue; }
