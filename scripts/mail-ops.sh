@@ -199,6 +199,7 @@ else
 fi
 
 digest=""
+alerts=""
 total_new=0 total_arch=0 total_trash=0 total_accts=0
 
 while IFS='|' read -r name host user pass trashfld; do
@@ -239,6 +240,10 @@ while IFS='|' read -r name host user pass trashfld; do
       imap "$host" "$user" "$pass" "EXPUNGE" >/dev/null
       total_trash=$((total_trash+1))
       mark="[trashed]"
+    elif [ "$act" = alert ]; then
+      # stays in the inbox; flagged into the owner alert digest below
+      mark="[ALERT]"
+      alerts="${alerts}${name} | ${subj} | ${from}\n"
     else
       mark=""
     fi
@@ -265,6 +270,22 @@ done < "$ACCTS_FILE"
 if [ "$total_new" -gt 0 ]; then
   notify "$(printf "mail sweep %s — %d new (%d archived, %d trashed)\n\n%b" \
     "$STAMP" "$total_new" "$total_arch" "$total_trash" "$digest")"
+fi
+
+# Important mail -> owner. matrix-relay ESCALATE matches "MAIL ALERT" so this
+# fans out to Matrix + reech email (+SMS once Twilio KYC is done).
+MAIL_ALERT_URL=${MAIL_ALERT_URL:-http://100.64.118.105:5000/notify-owner}
+if [ -n "$alerts" ]; then
+  n_alert=$(printf '%b' "$alerts" | grep -c .)
+  body=$(printf "MAIL ALERT — %d important email(s) arrived:\n\n%b" "$n_alert" "$alerts")
+  # dispatcher image has no jq/python — escape JSON by hand
+  body_json=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' '\036' | sed 's/\x1e/\\n/g')
+  curl -s --connect-timeout 8 --max-time 15 -X POST "$MAIL_ALERT_URL" \
+    -H "Content-Type: application/json" \
+    -d "{\"text\": \"$body_json\"}" \
+    >/dev/null 2>&1 \
+    && log "alerted owner on $n_alert important message(s)" \
+    || log "WARN: owner mail alert failed (relay unreachable)"
 fi
 [ "$DB_OK" = 1 ] && record_sweep "$total_accts" "$total_new" "$total_arch" \
     "$total_trash" "swept $total_accts account(s)"
