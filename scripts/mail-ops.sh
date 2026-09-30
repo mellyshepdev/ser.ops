@@ -200,21 +200,24 @@ record_sweep(){ # accounts new archived trashed forwarded note
             ${3:-0}, ${4:-0}, $(sqlq "${5:-}"))" >/dev/null 2>&1
 }
 
-rule_action(){ # from subject -> action token set (keep|trash|alert|forward,...)
+rule_action(){ # from subject account -> action token set (keep|trash|alert|forward,...)
   # `field` used to be parsed and then thrown away, so from:/subject: were
   # both matched against the two concatenated — a from: rule could fire on a
   # subject line. And $glob was quoted inside *"$glob"*, which made * a
   # literal asterisk: the documented from:*@linkedin.com example could never
   # match anything. Unquoted, wrapped in *...*, so plain substrings still work.
-  local from=$1 subj=$2 pat act field glob hay
+  # `account:` matches the mailbox name (first field of the accounts row) so a
+  # whole mailbox can be routed — e.g. `account:partnerships|alert`.
+  local from=$1 subj=$2 acct=$3 pat act field glob hay
   [ -f "$RULES_FILE" ] || { echo keep; return; }
   while IFS='|' read -r pat act; do
     case "$pat" in ''|\#*) continue;; esac
     field=${pat%%:*}; glob=${pat#*:}
     case "$field" in
-      from)    hay=$from ;;
-      subject) hay=$subj ;;
-      *)       hay="$from $subj" ;;
+      from)            hay=$from ;;
+      subject)         hay=$subj ;;
+      account|mailbox) hay=$acct ;;
+      *)               hay="$from $subj" ;;
     esac
     # shellcheck disable=SC2254  # $glob is deliberately a pattern here
     case "$hay" in
@@ -321,7 +324,7 @@ sweep_folder(){
       rm -f "$msg_tmp"; continue
     fi
     cat "$msg_tmp" >> "$mbox_tmp"; total_arch=$((total_arch+1))
-    act=$(rule_action "$from" "$subj")
+    act=$(rule_action "$from" "$subj" "$name")
     mark=""
     if has_act "$act" forward; then
       if forward_msg "$msg_tmp"; then
