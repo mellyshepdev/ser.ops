@@ -30,13 +30,12 @@ services:
       UNIT_NAME: "${UNIT_NAME:-unit7}"
       REPO: /srv/ser.ops
       STATE_DIR: /srv/ser.ops/state
-      # One job per SLOT, worked for up to the whole slot, then the pointer
-      # moves on. An hour is the intended cadence. SLOT_SECONDS is the knob;
-      # TICK_SECONDS is kept only so an older override still resolves, and is
-      # now a fallback rather than the default — leaving it at 1800 is what
-      # kept the dispatcher on 30-minute slots after the rewrite.
-      SLOT_SECONDS: "${SLOT_SECONDS:-3600}"
-      TICK_SECONDS: "${TICK_SECONDS:-3600}"
+      # tick.sh wake-up interval = how often rotate.sh sweeps the task table
+      # and dispatches every due task. 30min sweeps halve deferral retry
+      # latency and backlog drain vs the old hourly slot; tasks still gate
+      # on their own intervals, and nothing waits behind anything anymore.
+      SLOT_SECONDS: "${SLOT_SECONDS:-1800}"
+      TICK_SECONDS: "${TICK_SECONDS:-1800}"
       # ssh looks up the key path under $HOME; without this it would try
       # /nonexistent for an unknown uid and every transfer would fail.
       HOME: /home/swoopg111
@@ -91,6 +90,7 @@ services:
       - .:/srv/ser.ops:ro
 
     environment:
+      UNIT_NAME: "${UNIT_NAME:-unit7}"
       REPO: /srv/ser.ops
       STATE_DIR: /srv/ser.ops/state
       # Bind all interfaces INSIDE the container; the published port below is

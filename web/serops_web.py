@@ -58,33 +58,45 @@ def read_events(date=None, since=None, task=None, phase=None, limit=None):
 
 
 def task_list():
-    """Ordered TASKS rows from rotate.sh: (name, interval_min, lockfile).
-    Reads the same table rotate.sh dispatches from, in declaration order,
-    so 'next task' mirrors the real rotation instead of a copy that drifts.
-    $STATE_DIR and the three X_LOCK vars are resolved to real paths."""
+    """Ordered task rows from the conf table: (name, interval_min, lane,
+    lockfile). Reads the same file rotate.sh dispatches from —
+    conf/tasks.<UNIT>.conf, else conf/tasks.conf — so the table can never
+    drift from the real schedule. The lock field is a bare name under
+    $STATE_DIR/locks ('-' means the per-task lock)."""
+    unit = os.environ.get("UNIT_NAME") or os.environ.get("UNIT", "unit7")
+    conf = os.path.join(REPO, "conf", f"tasks.{unit}.conf")
+    if not os.path.exists(conf):
+        conf = os.path.join(REPO, "conf", "tasks.conf")
+    locks_dir = os.path.join(STATE_DIR, "locks")
     rows = []
-    vars_ = {}
     try:
-        with open(ROTATE_SH, "r", encoding="utf-8", errors="replace") as fh:
+        with open(conf, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                v = re.match(r'\s*([A-Z_]+_LOCK)="\$STATE_DIR/([^"]+)"', line)
-                if v:
-                    vars_[v.group(1)] = os.path.join(STATE_DIR, v.group(2))
-                m = re.match(r'\s*"([a-z0-9-]+)\|(\d+)\|([^|]+)\|', line)
-                if m:
-                    lock = m.group(3).strip().replace("$STATE_DIR", STATE_DIR)
-                    for k, p in vars_.items():
-                        lock = lock.replace(f"${k}", p)
-                    rows.append((m.group(1), int(m.group(2)), lock))
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("|")
+                if len(parts) < 6:
+                    continue
+                name, interval, lane, _budget, lock = (p.strip() for p in parts[:5])
+                if not name:
+                    continue
+                try:
+                    interval = int(interval)
+                except ValueError:
+                    interval = 60
+                if not lock or lock == "-":
+                    lock = name
+                rows.append((name, interval, lane or "light",
+                             os.path.join(locks_dir, lock + ".lock")))
     except OSError:
         pass
     return rows
 
 
 def task_table():
-    """Parse the TASKS array out of rotate.sh so health reflects the real
-    schedule rather than a copy that drifts."""
-    return {name: interval for name, interval, _ in task_list()}
+    """name -> interval for the health table, parsed from the live conf."""
+    return {name: interval for name, interval, _lane, _lock in task_list()}
 
 
 def lock_held(path):
@@ -105,10 +117,10 @@ def lock_held(path):
         os.close(fd)
 
 
-def current_run():
-    """The in-flight dispatch: a (run_id, task) with a start event but no
-    terminal done/fail/skip. Scan-phase skips share the run_id but carry a
-    different task name, so they must not close the started task's run.
+def current_runs():
+    """All in-flight dispatches: (run_id, task) pairs with a start event but
+    no terminal done/fail/skip. Parallel lanes mean several runners can be
+    alive at once — this returns all of them, newest first.
     Yesterday's file is included — a task can span the UTC rollover."""
     open_runs = {}
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -122,47 +134,45 @@ def current_run():
                 open_runs.pop(key, None)
             elif ph == "step" and key in open_runs:
                 open_runs[key]["_step"] = ev.get("msg")
-    if not open_runs:
-        return None
-    ev = max(open_runs.values(), key=lambda e: e.get("ts", ""))
-    try:
-        start = datetime.strptime(ev["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        elapsed = int(time.time() - start.timestamp())
-    except (KeyError, ValueError):
-        elapsed = None
-    return {
-        "task": ev.get("task"), "run_id": ev.get("run_id"),
-        "start_ts": ev.get("ts"), "elapsed_s": elapsed,
-        "step": ev.get("_step"), "msg": ev.get("msg"),
-    }
+    out = []
+    for ev in sorted(open_runs.values(), key=lambda e: e.get("ts", ""), reverse=True):
+        try:
+            start = datetime.strptime(ev["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            elapsed = int(time.time() - start.timestamp())
+        except (KeyError, ValueError):
+            elapsed = None
+        out.append({
+            "task": ev.get("task"), "run_id": ev.get("run_id"),
+            "start_ts": ev.get("ts"), "elapsed_s": elapsed,
+            "step": ev.get("_step"), "msg": ev.get("msg"),
+        })
+    return out
 
 
-def next_task():
-    """Predict what the next tick picks — the same scan rotate.sh runs:
-    from index+1, first task due (age >= interval) with a free lock."""
+def due_tasks():
+    """What the next sweep would dispatch, mirroring rotate.sh's due-check:
+    age >= interval (start-to-start), no live .run marker, .defer passed."""
     rows = task_list()
-    n = len(rows)
-    if not n:
-        return None
-    try:
-        with open(os.path.join(ROTATE_DIR, "index"), "r") as fh:
-            idx = int(fh.read().strip())
-    except (OSError, ValueError):
-        idx = -1
     now = time.time()
-    for k in range(1, n + 1):
-        i = (idx + k) % n
-        name, interval, lock = rows[i]
+    due = []
+    for i, (name, interval, lane, _lock) in enumerate(rows):
+        if os.path.exists(os.path.join(ROTATE_DIR, f"{name}.run")):
+            continue
         try:
             age = now - os.path.getmtime(os.path.join(ROTATE_DIR, f"{name}.last"))
         except OSError:
             age = float("inf")
         if age < interval * 60:
             continue
-        if lock and lock_held(lock):
+        try:
+            with open(os.path.join(ROTATE_DIR, f"{name}.defer")) as fh:
+                defer = float(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            defer = 0
+        if defer > now:
             continue
-        return {"task": name, "slot": i, "interval_min": interval}
-    return None
+        due.append({"task": name, "slot": i, "interval_min": interval, "lane": lane})
+    return due
 
 
 def summary(date=None):
@@ -210,18 +220,25 @@ def health():
         rows.append({
             "task": name, "interval_min": interval,
             "last_dispatch": last_iso, "age_min": age_min,
-            # A task is overdue once it has gone longer than its interval plus
-            # one full 4h rotation orbit (8 tasks x 30min tick).
-            "overdue": (age_min is not None and age_min > interval + 240),
+            # Overdue = interval plus ~three sweeps of grace (ticks are ~30min).
+            "overdue": (age_min is not None and age_min > interval + 90),
             "done": d.get("done", 0), "fail": d.get("fail", 0),
             "skip": d.get("skip", 0), "median_ms": d.get("median_ms"),
         })
+    due = due_tasks()
     return {
-        "unit": "unit7", "date": today(), "generated": datetime.now(timezone.utc).isoformat(),
+        "unit": os.environ.get("UNIT_NAME") or os.environ.get("UNIT", "unit7"),
+        "date": today(), "generated": datetime.now(timezone.utc).isoformat(),
         "server_now": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "current": current_run(), "next": next_task(),
+        "current": current_runs(),
+        "next": due[0] if due else None,
+        "due": [t["task"] for t in due],
+        "due_count": len(due),
         "ticks_today": ticks,
-        "wasted_ticks": len([e for e in skips if (e.get("detail") or {}).get("reason") in ("lock_held", "none_free")]),
+        # A wasted tick is a dispatcher-level skip (task=rotate): the sweep
+        # woke and dispatched nothing. Task-level skips are scheduling, not
+        # waste.
+        "wasted_ticks": len([e for e in skips if e.get("task") == "rotate"]),
         "skip_reasons": reasons,
         "tasks": rows,
         "events_today": len(evs),
@@ -268,7 +285,7 @@ padding:12px 16px;flex:1 1 160px}
 .nowbox .clock .v{font-size:26px;color:var(--amber);font-variant-numeric:tabular-nums}
 .nowbox .sub2{color:var(--faint);font-size:11px;margin-top:3px}
 </style></head><body>
-<h1>ser.ops — unit7</h1>
+<h1 id="unittitle">ser.ops</h1>
 <div class="sub"><span id="live"></span><span id="livetxt">connecting…</span> · event file <span id="ef"></span></div>
 <div class="cards" id="cards"></div>
 <div class="wrap"><table id="tasks"><thead><tr><th>task</th><th>interval</th><th>last dispatch</th>
@@ -297,14 +314,16 @@ function tickClock(){
 }
 async function health(){
   const h=await (await fetch('api/health')).json();
+  $('#unittitle').textContent='ser.ops — '+h.unit;
   $('#ef').textContent=h.event_file;
   clockSkew=h.server_now?Date.parse(h.server_now)-Date.now():0;
-  curStart=h.current?Date.parse(h.current.start_ts):null;
-  $('#cur-task').textContent=h.current?h.current.task:'idle';
-  $('#cur-step').textContent=h.current?(h.current.step||h.current.msg||''):'no task running';
-  $('#cur-since').textContent=h.current?('since '+h.current.start_ts):'';
-  $('#next-task').textContent=h.next?h.next.task:'—';
-  $('#next-det').textContent=h.next?('slot '+h.next.slot+' · '+h.next.interval_min+'m interval'):'nothing due';
+  const cur=h.current&&h.current.length?h.current:null;
+  curStart=cur?Date.parse(cur[cur.length-1].start_ts):null;   // oldest run owns the clock
+  $('#cur-task').textContent=cur?cur.map(c=>c.task).join(' · '):'idle';
+  $('#cur-step').textContent=cur?(cur[0].step||cur[0].msg||'')+(cur.length>1?' · +'+(cur.length-1)+' more':'') :'no task running';
+  $('#cur-since').textContent=cur?('since '+cur[cur.length-1].start_ts):'';
+  $('#next-task').textContent=h.next?(h.due_count>1?h.due_count+' tasks due':h.next.task):'—';
+  $('#next-det').textContent=h.next?('first: '+h.next.task+' · '+h.next.lane+' lane · '+h.next.interval_min+'m interval'):'nothing due';
   if(!ticker)ticker=setInterval(tickClock,1000);
   tickClock();
   const waste=h.ticks_today?Math.round(100*h.wasted_ticks/h.ticks_today):0;
