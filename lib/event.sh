@@ -12,8 +12,11 @@
 #     containing a quote or backslash would otherwise produce an unparseable
 #     line and silently truncate the dashboard.
 
-: "${STATE_DIR:=/home/swoopg111/projects/ser.ops/state}"
-: "${UNIT:=${UNIT_NAME:-unit7}}"
+# Defaults are host-agnostic: STATE_DIR derives from this lib's own location
+# (repo/state), UNIT from UNIT_NAME then hostname — ser.ops is portable infra,
+# not a unit7 fixture. Callers normally export both before sourcing.
+: "${STATE_DIR:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/state}"
+: "${UNIT:=${UNIT_NAME:-$(hostname -s 2>/dev/null || echo unknown)}}"
 : "${RUN_ID:=$(date +%s)-$$}"
 EVENT_DIR="$STATE_DIR/events"
 
