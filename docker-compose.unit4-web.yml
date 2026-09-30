@@ -1,0 +1,22 @@
+# unit4 web-only variant — the ser-ops DISPATCHER stays on unit7 (its mounts
+# are unit7-local: ~/backups, ~/.ssh, ~/.pgpass, xvdbz1 volume-archive).
+# This container is the read-only dashboard over the event stream; note the
+# repo dir here is a SNAPSHOT copy — live state/ updates on unit7 do not
+# propagate until the dispatcher moves or a sync is wired up.
+services:
+  ser-ops-web:
+    image: python:3.12-alpine
+    container_name: ser-ops
+    restart: unless-stopped
+    init: true
+    user: "1001:1001"
+    volumes:
+      - /home/swoopg111/projects/ser.ops:/srv/ser.ops:ro
+    environment:
+      REPO: /srv/ser.ops
+      STATE_DIR: /srv/ser.ops/state
+      SEROPS_BIND: "0.0.0.0"
+      SEROPS_PORT: "8137"
+    ports:
+      - "100.123.158.58:8137:8137"
+    command: ["python3", "/srv/ser.ops/web/serops_web.py"]
