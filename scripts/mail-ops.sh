@@ -1,22 +1,39 @@
 #!/usr/bin/env bash
-# mail-ops.sh — rotation task: sweep IMAP inboxes, archive new mail to
-# unit3, apply user rules (trash/keep), digest new arrivals to Linear.
+# mail-ops.sh — rotation task: sweep IMAP mailboxes, archive new mail to
+# unit3, apply user rules (trash/keep/alert/forward), digest new arrivals to
+# Linear.
 #
 # Accounts:  deploy/mail-accounts.conf   (GITIGNORED — app passwords)
-#   # name|host|user|pass|trash_folder
-#   gmail|imap.gmail.com|you@gmail.com|xxxx xxxx xxxx xxxx|[Gmail]/Trash
+#   # name|host|user|pass|trash_folder|folders
+#   gmail|imap.gmail.com|you@gmail.com|xxxx xxxx xxxx xxxx|[Gmail]/Trash|INBOX,[Gmail]/All Mail,[Gmail]/Spam
+#   The 6th field is optional — default INBOX. Comma-separated IMAP folders.
 # Rules:     deploy/mail-rules.conf
-#   # from:<glob>|subject:<glob>|keep|trash   (first match wins)
+#   # from:<glob>|subject:<glob>|action[,action...]   (first match wins)
 #   from:*@linkedin.com|trash
+#   Actions: keep (default), trash, alert (owner notify), forward (remail the
+#   raw RFC822 to $FORWARD_TO over SMTP — the ebay-mail-poller's intake).
 #
 # Semantics:
-#   - Every unseen message is archived (full RFC822 -> mbox.gz -> unit3)
+#   - Every message not yet swept is archived (full RFC822 -> mbox.gz -> unit3)
 #     BEFORE any rule action — nothing is lost, ever.
+#   - Searches cover SEEN mail too: "I already read it on my phone" is exactly
+#     how the 2026-09 eBay sale mails got missed — unseen-only sweeps skipped
+#     them, and mails filed straight into labels never touch INBOX at all.
+#     Dedup (account,folder,uid) + per-account Message-ID index make
+#     re-finding old mail free and cross-folder copies single-processed.
 #   - trash = copy to the account's trash folder + \Deleted + EXPUNGE.
 #     Recoverable from provider trash for ~30 days. Nothing is hard-deleted.
-#   - keep/default = left in the inbox untouched.
+#   - keep/default = left in place untouched.
+#   - forward = remail verbatim to FORWARD_TO (default sales@) — from/subject
+#     headers stay original so downstream parsers see the real mail.
 #   - Digest of new arrivals -> Linear comment on LINEAR_MAIL_ISSUE +
 #     ~/backups/mail/digest-<stamp>.txt.
+#
+# Windows: MAIL_SINCE_DAYS (default 2) bounds every folder search;
+# MAIL_SINCE_DAYS_<FOLDERKEY> overrides per folder (FOLDERKEY = folder name
+# uppercased, [^A-Z0-9]->_). MAIL_MAX_UIDS caps uid count per folder per run
+# (default 150); MAIL_MAX_UIDS_<FOLDERKEY> likewise. For a deep backfill run
+# detached, e.g.:  MAIL_SINCE_DAYS=400 MAIL_MAX_UIDS=20000 bash mail-ops.sh
 set -u
 
 REPO="${REPO:-/home/swoopg111/projects/ser.ops}"
@@ -37,6 +54,12 @@ REMOTE_DIR=${REMOTE_DIR:-backups/mail}
 LOCAL_DIR=${LOCAL_DIR:-/home/swoopg111/backups/mail}
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 STAMP=$(date +%Y%m%d-%H%M%S)
+# Forward target for the `forward` rule action — the sales pipeline mailbox on
+# unit2's docker-mailserver (inbound SMTP is open on tailnet :25, no auth
+# needed for delivery to hosted domains).
+FORWARD_TO=${FORWARD_TO:-sales@theofficialblacksheepco.com}
+SMTP_HOST=${SMTP_HOST:-100.64.118.105}
+SMTP_PORT=${SMTP_PORT:-25}
 
 exec 9>"$LOCK"; flock -n 9 || { echo "mail-ops busy"; exit 0; }
 mkdir -p "$STATE_DIR" "$LOCAL_DIR"
@@ -75,21 +98,37 @@ imap_url(){
   esac
 }
 
+# Folder names go in the URL path — escape the characters curl and the IMAP
+# layer care about ([ ] confuse curl's URL parser unless -g; spaces need %20).
+folder_enc(){ printf '%s' "$1" | sed 's/\[/%5B/g; s/\]/%5D/g; s/ /%20/g; s/&/%26/g'; }
+# Filesystem-safe key for per-folder state files and env-var suffixes.
+folder_key(){ printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '_'; }
+
 # Set IMAP_INSECURE=1 for a backend addressed by IP, whose certificate cannot
 # match the hostname. It is still encrypted — only the name check is skipped.
 IMAP_INSECURE=${IMAP_INSECURE:-0}
 curl_tls(){ [ "$IMAP_INSECURE" = 1 ] && printf -- '--ssl -k' || printf -- '--ssl'; }
 
-imap(){ # host user pass command -> stdout
+imap(){ # host user pass folder command -> stdout
   # shellcheck disable=SC2046  # curl_tls is deliberately word-split
-  curl -s --connect-timeout 15 --max-time 60 $(curl_tls) \
-    --user "$2:$3" "$(imap_url "$1")/INBOX" -X "$4" 2>/dev/null
+  curl -sg --connect-timeout 15 --max-time 60 $(curl_tls) \
+    --user "$2:$3" "$(imap_url "$1")/$(folder_enc "$4")" -X "$5" 2>/dev/null
 }
 
-fetch_msg(){ # host user pass uid -> RFC822 on stdout
+fetch_msg(){ # host user pass folder uid -> RFC822 on stdout
   # shellcheck disable=SC2046
-  curl -s --connect-timeout 15 --max-time 120 $(curl_tls) \
-    --user "$2:$3" "$(imap_url "$1")/INBOX;UID=$4" 2>/dev/null
+  curl -sg --connect-timeout 15 --max-time 120 $(curl_tls) \
+    --user "$2:$3" "$(imap_url "$1")/$(folder_enc "$4");UID=$5" 2>/dev/null
+}
+
+# Remail a raw RFC822 file to $FORWARD_TO — the message lands as-received
+# (original From/Subject/body) so the ebay-mail-poller parses it natively.
+forward_msg(){ # eml_file
+  curl -s --connect-timeout 10 --max-time 60 \
+    --mail-from "mail-ops@theofficialblacksheepco.com" \
+    --mail-rcpt "$FORWARD_TO" \
+    -T "$1" \
+    "smtp://$SMTP_HOST:$SMTP_PORT" >/dev/null 2>&1
 }
 
 # SQL string literal — same quoting helper as backup-volumes-db.sh.
@@ -112,8 +151,7 @@ ensure_schema(){
       sent_raw  STRING,
       action    STRING,
       archive   STRING,
-      swept_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE (account, uid)
+      swept_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE TABLE IF NOT EXISTS sweeps (
       id         UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -123,38 +161,46 @@ ensure_schema(){
       note       STRING,
       swept_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );" >/dev/null 2>&1
+  # 2026-09-30: multi-folder sweeping — uid is only unique per folder, and the
+  # same message appears under DIFFERENT uids in INBOX vs All Mail. folder +
+  # msg_id columns carry that; dedup keys on (account, folder, uid) with
+  # msg_id checked before body fetch so cross-folder copies are swept once.
+  # Each migration runs separately and is individually idempotent — CRDB has
+  # no ADD CONSTRAINT IF NOT EXISTS and rejects DROP CONSTRAINT on UNIQUE
+  # indexes (DROP INDEX CASCADE is the form it accepts).
+  crsql -d "$CR_DB" -e \
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS folder STRING NOT NULL DEFAULT 'INBOX'" >/dev/null 2>&1
+  crsql -d "$CR_DB" -e \
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS msg_id STRING" >/dev/null 2>&1
+  crsql -d "$CR_DB" -e \
+    "DROP INDEX IF EXISTS messages@messages_account_uid_key CASCADE" >/dev/null 2>&1
+  crsql -d "$CR_DB" --format=csv -e "SHOW CONSTRAINTS FROM messages" 2>/dev/null \
+    | grep -q messages_acct_fold_uid_key \
+    || crsql -d "$CR_DB" -e \
+      "ALTER TABLE messages ADD CONSTRAINT messages_acct_fold_uid_key
+       UNIQUE (account, folder, uid)" >/dev/null 2>&1
+  return 0
 }
 
-# UNIQUE(account,uid) makes this the dedup source of truth. DO NOTHING means a
-# re-run after a crash re-archives nothing and re-trashes nothing.
-record_msg(){ # account uid from subject date action archive
+# Bare ON CONFLICT DO NOTHING (no arbiter) — skips rows violating whichever
+# unique constraint is live, so the mid-migration window is still safe.
+record_msg(){ # account folder uid from subject date action archive msg_id
   crsql -d "$CR_DB" -e "INSERT INTO messages
-      (unit, account, uid, msg_from, subject, sent_raw, action, archive)
+      (unit, account, folder, uid, msg_from, subject, sent_raw, action, archive, msg_id)
     VALUES ($(sqlq "$UNIT_SELF"), $(sqlq "$1"), $(sqlq "$2"), $(sqlq "$3"),
-            $(sqlq "$4"), $(sqlq "$5"), $(sqlq "$6"), $(sqlq "$7"))
-    ON CONFLICT (account, uid) DO NOTHING" >/dev/null 2>&1
+            $(sqlq "$4"), $(sqlq "$5"), $(sqlq "$6"), $(sqlq "$7"),
+            $(sqlq "$8"), $(sqlq "$9"))
+    ON CONFLICT DO NOTHING" >/dev/null 2>&1
 }
 
-record_sweep(){ # accounts new archived trashed note
+record_sweep(){ # accounts new archived trashed forwarded note
   crsql -d "$CR_DB" -e "INSERT INTO sweeps
       (unit, run_id, accounts, new_msgs, archived, trashed, note)
     VALUES ($(sqlq "$UNIT_SELF"), $(sqlq "${RUN_ID:-}"), ${1:-0}, ${2:-0},
             ${3:-0}, ${4:-0}, $(sqlq "${5:-}"))" >/dev/null 2>&1
 }
 
-# Has this uid already been swept? DB first, falling back to the flat
-# seen-file so a cockroach outage degrades to the old behaviour instead of
-# re-archiving and re-trashing everything.
-already_seen(){ # account uid seen_file
-  if [ "$DB_OK" = 1 ]; then
-    [ "$(crsql -d "$CR_DB" --format=csv -e \
-        "SELECT count(*) FROM messages WHERE account=$(sqlq "$1") AND uid=$(sqlq "$2")" \
-        | tail -1 | tr -d '[:space:]')" != "0" ] && return 0
-  fi
-  grep -qx "$2" "$3"
-}
-
-rule_action(){ # from subject -> keep|trash
+rule_action(){ # from subject -> action token set (keep|trash|alert|forward,...)
   # `field` used to be parsed and then thrown away, so from:/subject: were
   # both matched against the two concatenated — a from: rule could fire on a
   # subject line. And $glob was quoted inside *"$glob"*, which made * a
@@ -178,6 +224,8 @@ rule_action(){ # from subject -> keep|trash
   echo keep
 }
 
+has_act(){ case ",$1," in *",$2,"*) return 0;; esac; return 1; }
+
 notify(){
   local body=$1
   printf '%s\n' "$body" > "$LOCAL_DIR/digest-$STAMP.txt"
@@ -200,66 +248,127 @@ fi
 
 digest=""
 alerts=""
-total_new=0 total_arch=0 total_trash=0 total_accts=0
+total_new=0 total_arch=0 total_trash=0 total_fwd=0 total_accts=0
 
-while IFS='|' read -r name host user pass trashfld; do
-  case "$name" in ''|\#*) continue;; esac
-  [ -z "${pass:-}" ] && { log "$name: no password configured — skip"; continue; }
-  trashfld=${trashfld:-Trash}
+# sweep_folder name host user pass trashfld folder — returns via globals:
+#   sf_digest, sf_alerts, sf_new, sf_arch, sf_trash, sf_fwd, and appends
+#   archived messages to $mbox_tmp (created by the caller).
+sweep_folder(){
+  local name=$1 host=$2 user=$3 pass=$4 trashfld=$5 folder=$6
+  local fkey days since uids seen_file known msgid_file
+  fkey=$(folder_key "$folder")
+  # Per-folder window + cap: INBOX keeps the tight default; deeper folders
+  # (All Mail) are allowed a wider window via env so past mail is covered.
+  eval "days=\${MAIL_SINCE_DAYS_$(printf '%s' "$fkey" | tr 'a-z' 'A-Z'):-\${MAIL_SINCE_DAYS:-2}}"
+  eval "maxuids=\${MAIL_MAX_UIDS_$(printf '%s' "$fkey" | tr 'a-z' 'A-Z'):-\${MAIL_MAX_UIDS:-150}}"
+  since=$(date -d "-$days days" +%d-%b-%Y 2>/dev/null || date +%d-%b-%Y)
 
-  seen_file="$STATE_DIR/seen-$name"
-  touch "$seen_file"
+  seen_file="$STATE_DIR/seen-$name-$fkey"
+  msgid_file="$STATE_DIR/msgid-$name"
+  # Folder-scoped seen files are new (2026-09-30) — seed INBOX's from the
+  # legacy single seen-file so its window isn't re-archived wholesale.
+  if [ "$folder" = "INBOX" ] && [ -f "$STATE_DIR/seen-$name" ] \
+      && [ ! -s "$seen_file" ]; then
+    cp "$STATE_DIR/seen-$name" "$seen_file"
+  fi
+  touch "$seen_file" "$msgid_file"
 
-  # UIDs of unseen mail, minus ones we've already processed
-  total_accts=$((total_accts+1))
+  # Prefetch the known-uid set once (DB ∪ seen-file) instead of a cockroach
+  # round-trip per uid — with seen mail in scope the candidate list is the
+  # whole window, and per-uid queries turned sweeps into multi-minute stalls.
+  known=$(mktemp)
+  if [ "$DB_OK" = 1 ]; then
+    crsql -d "$CR_DB" --format=csv -e \
+      "SELECT uid FROM messages WHERE account=$(sqlq "$name") AND folder=$(sqlq "$folder")" \
+      | tail -n +2 | tr -d '\r' >> "$known"
+  fi
+  cat "$seen_file" >> "$known"
+
   # IMAP speaks CRLF. Without the \r strip the last token off "* SEARCH 1"
   # is "1\r", which fails ^[0-9]+$ — so this found zero UIDs on every run and
   # reported "nothing new" no matter how full the mailbox was.
   #
-  # Bound the search: a raw "UID SEARCH UNSEEN" on a Gmail inbox holding tens
-  # of thousands of unread messages makes Gmail silently drop the connection
-  # (verified: 43.5K unseen, server closes after the command). A rolling
-  # SINCE window keeps every sweep small; MAIL_MAX_UIDS caps worst case.
-  since=$(date -d "-${MAIL_SINCE_DAYS:-2} days" +%d-%b-%Y 2>/dev/null \
-    || date +%d-%b-%Y)
-  uids=$(imap "$host" "$user" "$pass" "UID SEARCH UNSEEN SINCE $since" \
+  # Bound the search: a raw "UID SEARCH" on a Gmail All Mail holding tens of
+  # thousands of messages makes Gmail silently drop the connection (verified:
+  # 43.5K unseen, server closes after the command). A rolling SINCE window
+  # keeps every sweep small; MAIL_MAX_UIDS caps worst case. SEEN mail is in
+  # scope on purpose — dedup, not unreadness, is what makes a message "new".
+  uids=$(imap "$host" "$user" "$pass" "$folder" "UID SEARCH SINCE $since" \
     | tr -d '\r' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n \
-    | tail -n "${MAIL_MAX_UIDS:-150}" | while read -r u; do
-        already_seen "$name" "$u" "$seen_file" || echo "$u"
+    | tail -n "$maxuids" | while read -r u; do
+        grep -Fxq "$u" "$known" || echo "$u"
       done)
-  [ -z "$uids" ] && { log "$name: nothing new"; continue; }
+  rm -f "$known"
+  [ -z "$uids" ] && { log "$name/$folder: nothing new"; return; }
 
-  month=$(date +%Y%m)
-  mbox_tmp=$(mktemp)
-  n=0
+  local n=0
   for u in $uids; do
-    # archive first — always
-    fetch_msg "$host" "$user" "$pass" "$u" >> "$mbox_tmp" && total_arch=$((total_arch+1))
-    # headers for digest + rules
-    hdr=$(imap "$host" "$user" "$pass" \
-      "UID FETCH $u (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+    # headers for digest + rules + cross-folder dedup (one fetch serves all)
+    hdr=$(imap "$host" "$user" "$pass" "$folder" \
+      "UID FETCH $u (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])")
     from=$(echo "$hdr" | grep -i '^From:' | head -1 | sed 's/^[Ff]rom: *//;s/\r//')
     subj=$(echo "$hdr" | grep -i '^Subject:' | head -1 | sed 's/^[Ss]ubject: *//;s/\r//')
     date_raw=$(echo "$hdr" | grep -i '^Date:' | head -1 | sed 's/^[Dd]ate: *//;s/\r//')
-    act=$(rule_action "$from" "$subj")
-    if [ "$act" = trash ]; then
-      imap "$host" "$user" "$pass" "UID COPY $u \"$trashfld\"" >/dev/null
-      imap "$host" "$user" "$pass" "UID STORE $u +FLAGS.SILENT (\\Deleted)" >/dev/null
-      imap "$host" "$user" "$pass" "EXPUNGE" >/dev/null
-      total_trash=$((total_trash+1))
-      mark="[trashed]"
-    elif [ "$act" = alert ]; then
-      # stays in the inbox; flagged into the owner alert digest below
-      mark="[ALERT]"
-      alerts="${alerts}${name} | ${subj} | ${from}\n"
-    else
-      mark=""
+    msg_id=$(echo "$hdr" | grep -i '^Message-Id:' | head -1 | sed 's/^[Mm]essage-[Ii]d: *//;s/\r//')
+    # Same mail re-listed under another folder's uid — already swept once.
+    if [ -n "$msg_id" ] && grep -Fxq "$msg_id" "$msgid_file"; then
+      echo "$u" >> "$seen_file"; continue
     fi
-    digest="${digest}$name | $subj | $from $mark\n"
-    [ "$DB_OK" = 1 ] && record_msg "$name" "$u" "$from" "$subj" "$date_raw" \
-        "${act:-keep}" "$REMOTE_HOST:$REMOTE_DIR/$name/$month.mbox.gz"
+    msg_tmp=$(mktemp)
+    # archive first — always
+    if ! fetch_msg "$host" "$user" "$pass" "$folder" "$u" > "$msg_tmp" \
+        || [ ! -s "$msg_tmp" ]; then
+      rm -f "$msg_tmp"; continue
+    fi
+    cat "$msg_tmp" >> "$mbox_tmp"; total_arch=$((total_arch+1))
+    act=$(rule_action "$from" "$subj")
+    mark=""
+    if has_act "$act" forward; then
+      if forward_msg "$msg_tmp"; then
+        mark="[fwd->$FORWARD_TO]"; total_fwd=$((total_fwd+1)); sf_fwd=$((sf_fwd+1))
+      else
+        # Don't mark seen — the next sweep retries the forward. The message
+        # stays archived (it's already in the mbox) and the DB insert is
+        # dedup'd, so the retry only costs a refetch.
+        log "$name/$folder: forward failed for uid $u — will retry next sweep"
+        rm -f "$msg_tmp"; continue
+      fi
+    fi
+    if has_act "$act" trash; then
+      imap "$host" "$user" "$pass" "$folder" "UID COPY $u \"$trashfld\"" >/dev/null
+      imap "$host" "$user" "$pass" "$folder" "UID STORE $u +FLAGS.SILENT (\\Deleted)" >/dev/null
+      imap "$host" "$user" "$pass" "$folder" "EXPUNGE" >/dev/null
+      total_trash=$((total_trash+1)); sf_trash=$((sf_trash+1))
+      mark="$mark[trashed]"
+    elif has_act "$act" alert; then
+      mark="$mark[ALERT]"
+      alerts="${alerts}${name}/${folder} | ${subj} | ${from}\n"
+    fi
+    rm -f "$msg_tmp"
+    digest="${digest}${name}/${folder} | ${subj} | ${from} ${mark}\n"
+    [ "$DB_OK" = 1 ] && record_msg "$name" "$folder" "$u" "$from" "$subj" \
+        "$date_raw" "$act" "$REMOTE_HOST:$REMOTE_DIR/$name/$month.mbox.gz" "$msg_id"
     echo "$u" >> "$seen_file"
-    n=$((n+1)); total_new=$((total_new+1))
+    [ -n "$msg_id" ] && echo "$msg_id" >> "$msgid_file"
+    n=$((n+1)); sf_new=$((sf_new+1)); total_new=$((total_new+1))
+  done
+}
+
+while IFS='|' read -r name host user pass trashfld folders; do
+  case "$name" in ''|\#*) continue;; esac
+  [ -z "${pass:-}" ] && { log "$name: no password configured — skip"; continue; }
+  trashfld=${trashfld:-Trash}
+  folders=${folders:-INBOX}
+
+  total_accts=$((total_accts+1))
+  month=$(date +%Y%m)
+  mbox_tmp=$(mktemp)
+  sf_new=0 sf_arch=0 sf_trash=0 sf_fwd=0
+  sf_digest="" sf_alerts=""
+
+  IFS=',' read -ra folder_list <<< "$folders"
+  for folder in "${folder_list[@]}"; do
+    sweep_folder "$name" "$host" "$user" "$pass" "$trashfld" "$folder"
   done
 
   # ship the month's archive (append — decompress, concat, recompress)
@@ -268,7 +377,7 @@ while IFS='|' read -r name host user pass trashfld; do
     ssh $SSH_OPTS "$REMOTE_HOST" "mkdir -p ~/$REMOTE_DIR/$name" 2>/dev/null
     { ssh $SSH_OPTS "$REMOTE_HOST" "zcat ~/$remote_file 2>/dev/null"; cat "$mbox_tmp"; } \
       | gzip -1 | ssh $SSH_OPTS "$REMOTE_HOST" "cat > ~/$remote_file.new && mv ~/$remote_file.new ~/$remote_file" \
-      && log "$name: archived $n msgs -> $remote_file" \
+      && log "$name: archived $sf_new msgs -> $remote_file" \
       || { mkdir -p "$LOCAL_DIR/$name"; cat "$mbox_tmp" | gzip -1 >> "$LOCAL_DIR/$name/$month.mbox.gz";
            log "$name: remote failed — archived locally"; }
   fi
@@ -276,8 +385,8 @@ while IFS='|' read -r name host user pass trashfld; do
 done < "$ACCTS_FILE"
 
 if [ "$total_new" -gt 0 ]; then
-  notify "$(printf "mail sweep %s — %d new (%d archived, %d trashed)\n\n%b" \
-    "$STAMP" "$total_new" "$total_arch" "$total_trash" "$digest")"
+  notify "$(printf "mail sweep %s — %d new (%d archived, %d forwarded, %d trashed)\n\n%b" \
+    "$STAMP" "$total_new" "$total_arch" "$total_fwd" "$total_trash" "$digest")"
 fi
 
 # Important mail -> owner. matrix-relay ESCALATE matches "MAIL ALERT" so this
@@ -296,5 +405,5 @@ if [ -n "$alerts" ]; then
     || log "WARN: owner mail alert failed (relay unreachable)"
 fi
 [ "$DB_OK" = 1 ] && record_sweep "$total_accts" "$total_new" "$total_arch" \
-    "$total_trash" "swept $total_accts account(s)"
-log "done: $total_new new, $total_arch archived, $total_trash trashed"
+    "$total_trash" "swept $total_accts account(s), $total_fwd forwarded"
+log "done: $total_new new, $total_arch archived, $total_fwd forwarded, $total_trash trashed"
