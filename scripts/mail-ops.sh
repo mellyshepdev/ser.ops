@@ -194,6 +194,69 @@ extract_excerpt(){ # eml_file -> one-line excerpt (<= ~320 chars)
   rm -f "$tmp"
 }
 
+# ---------------------------------------------------------------------------
+# Order/shipping watcher — every archived message is scanned for marketplace
+# sale and shipment notices (eBay "you made the sale", "remember to ship",
+# carrier tracking mails). Extracted fields POST to the inventory API, which
+# settles stock + stamps tracking/buyer on sold_items. Config via env:
+#   INVENTORY_SALE_URL — /api/ebay/sale endpoint (empty disables entirely)
+#   INVENTORY_ADMIN_KEY — X-Admin-Key for that API
+# ---------------------------------------------------------------------------
+INVENTORY_SALE_URL=${INVENTORY_SALE_URL:-}
+INVENTORY_ADMIN_KEY=${INVENTORY_ADMIN_KEY:-${SCANNER_ADMIN_KEY:-}}
+
+order_parse(){ # account msg_file — silent unless a pattern fires
+  [ -z "$INVENTORY_SALE_URL" ] && return 0
+  local f=$2 subj body order itemnum buyer shipto track total carrier itemname
+  subj=$(grep -im1 '^Subject:' "$f" | sed 's/^Subject: *//;s/\r//')
+  case "$subj" in
+    *"made the sale"*|*"emember to ship"*|*"rder confirmed"*|*"rder details"*|\
+    *"has shipped"*|*"hipped"*|*"racking"*|*"hipping label"*|*"elivery"*) ;;
+    *) return 0 ;;
+  esac
+  # Flatten to one line: join QP soft-breaks, strip tags, decode the common
+  # entities. Order/item/tracking numbers are pure ASCII so they survive this.
+  body=$(awk '{ line=$0; while (line ~ /=$/) { if (getline nxt) line=substr(line,1,length(line)-1) nxt; else break } print line }' "$f" \
+         | sed -e 's/<[^>]*>/ /g' -e 's/&nbsp;/ /g' -e 's/&amp;/\&/g' \
+               -e 's/=3[Dd]/=/g' -e 's/=[0-9A-Fa-f][0-9A-Fa-f]/ /g' \
+         | tr '\n\t' '  ' | tr -d '\r' | tr -s ' ')
+  order=$(printf '%s' "$body" | grep -oE '[0-9]{2}-[0-9]{5}-[0-9]{5}' | head -1)
+  [ -z "$order" ] && return 0
+  itemnum=$(printf '%s' "$body" | grep -ioE 'item number.{0,90}' | head -1 \
+            | grep -oE '[0-9]{10,14}' | head -1)
+  # eBay lays fields out 'Item Number <n> Buyer <user> Qty' — anchor the buyer
+  # lookup after the item-number hit so 'buyer is waiting' doesn't match.
+  buyer=$(printf '%s' "$body" | grep -ioE 'item number.{0,250}' | head -1 \
+          | grep -ioE 'buyer[^a-z0-9_]{0,40}[a-z0-9_]+' | head -1 \
+          | sed -E 's/^[Bb]uyer[^A-Za-z0-9_]*//')
+  [ -z "$buyer" ] && buyer=$(printf '%s' "$body" \
+          | grep -ioE 'buyer[^a-z0-9_]{0,40}[a-z0-9_]+' \
+          | grep -ivE 'buyer[^a-z0-9_]+(is|was|the|a|will|has|paid|can|still|now)' \
+          | head -1 | sed -E 's/^[Bb]uyer[^A-Za-z0-9_]*//')
+  shipto=$(printf '%s' "$body" | grep -ioE 'ship to.{0,140}' | head -1 \
+           | sed -E 's/^[Ss]hip to *//;s/ (Package|package|Qty|Item|tracking|Tracking|Total).*$//' )
+  track=$(printf '%s' "$body" | grep -oE '1Z[0-9A-Z]{16}|9[0-9]{19,22}|TBA[0-9]{9,13}' | head -1)
+  total=$(printf '%s' "$body" | grep -ioE 'total charged.{0,60}|order total.{0,60}|total:.{0,60}' | head -1 \
+          | grep -oE '[0-9]+\.[0-9]{2}' | head -1)
+  case "$track" in
+    1Z*) carrier="UPS" ;; 9*) carrier="USPS" ;; TBA*) carrier="Amazon" ;; *) carrier="" ;;
+  esac
+  itemname=$(printf '%s' "$subj" | sed -E 's/.*(made the sale for|emember to ship) //I')
+
+  # Sale email (item resolvable) vs shipping-only email.
+  if [ -n "$itemnum" ]; then
+    payload="{\"order_id\":\"$order\",\"buyer\":\"$buyer\",\"ship_to\":\"$shipto\",\"total\":\"$total\",\"items\":[{\"item_number\":\"$itemnum\",\"qty\":1,\"name\":\"$(printf '%s' "$itemname" | sed 's/"/\\"/g')\"}]}"
+  else
+    [ -z "$track" ] && [ -z "$buyer" ] && [ -z "$shipto" ] && return 0
+    payload="{\"order_id\":\"$order\",\"tracking_number\":\"$track\",\"carrier\":\"$carrier\",\"buyer\":\"$buyer\",\"ship_to\":\"$shipto\",\"total\":\"$total\"}"
+  fi
+  resp=$(curl -s --max-time 15 -X POST "$INVENTORY_SALE_URL" \
+        -H 'Content-Type: application/json' \
+        -H "X-Admin-Key: $INVENTORY_ADMIN_KEY" \
+        -d "$payload" 2>/dev/null)
+  log "$1: orderwatch $order -> ${resp:-no-response}"
+}
+
 # SQL string literal — same quoting helper as backup-volumes-db.sh.
 sqlq(){ printf "'%s'" "${1//\'/\'\'}"; }
 
@@ -389,6 +452,7 @@ sweep_folder(){
       rm -f "$msg_tmp"; continue
     fi
     cat "$msg_tmp" >> "$mbox_tmp"; total_arch=$((total_arch+1))
+    order_parse "$name" "$msg_tmp"
     # Header FETCH can come back unparsable (that was the "blank notification"
     # bug) — the full RFC822 is already on disk, so recover the fields from it.
     [ -z "$from" ] && from=$(grep -im1 '^From:' "$msg_tmp" | sed 's/^From: *//;s/\r//')
