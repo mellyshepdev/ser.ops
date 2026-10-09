@@ -49,7 +49,7 @@ REMOTE_HOST=${REMOTE_HOST:-unit3-tailscale}
 # from whom, and did we bin it" stops being a grep over digest text files.
 CR_CONTAINER=${CR_CONTAINER:-puffbase-cockroach}
 CR_DB=${CR_DB:-mail_ops}
-UNIT_SELF=${UNIT_NAME:-unit7}
+UNIT_SELF=${UNIT_NAME:-unit4}
 REMOTE_DIR=${REMOTE_DIR:-backups/mail}
 LOCAL_DIR=${LOCAL_DIR:-/home/swoopg111/backups/mail}
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
@@ -58,8 +58,16 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 # unit2's docker-mailserver (inbound SMTP is open on tailnet :25, no auth
 # needed for delivery to hosted domains).
 FORWARD_TO=${FORWARD_TO:-sales@theofficialblacksheepco.com}
-SMTP_HOST=${SMTP_HOST:-100.64.118.105}
-SMTP_PORT=${SMTP_PORT:-25}
+# unit9's mail edge over tailnet — SMTP for forwards + owner alert mail, and
+# the IMAP host used in deploy/mail-accounts.conf. The old 100.64.118.105
+# (unit2-era relay) is gone from the tailnet entirely.
+SMTP_HOST=${SMTP_HOST:-100.94.170.118}
+SMTP_PORT=${SMTP_PORT:-465}
+# Submission auth — any hosted mailbox works; set in deploy/ser_ops.env.
+SMTP_USER=${SMTP_USER:-}
+SMTP_PASS=${SMTP_PASS:-}
+# Owner alert-mail recipient — the mailbox that actually gets read.
+OWNER_NOTIFY_EMAIL=${OWNER_NOTIFY_EMAIL:-swoopg111@puff-base.com}
 
 exec 9>"$LOCK"; flock -n 9 || { echo "mail-ops busy"; exit 0; }
 mkdir -p "$STATE_DIR" "$LOCAL_DIR"
@@ -121,14 +129,69 @@ fetch_msg(){ # host user pass folder uid -> RFC822 on stdout
     --user "$2:$3" "$(imap_url "$1")/$(folder_enc "$4");UID=$5" 2>/dev/null
 }
 
+# Authenticated SMTPS through unit9's mail edge — port 25 on the tailnet is
+# the locator-edge relay which refuses delivery (Relay access denied); :587's
+# AUTH stalls through the proxy; :465 SMTPS + any mailbox creds works.
+smtp_send(){ # mail_from rcpt eml_file -> curl rc
+  local extra=""
+  [ -n "${SMTP_USER:-}" ] && extra="--user $SMTP_USER:$SMTP_PASS"
+  # shellcheck disable=SC2086 # $extra is deliberately word-split
+  curl -s --connect-timeout 10 --max-time 60 -k $extra \
+    --mail-from "$1" --mail-rcpt "$2" -T "$3" \
+    "${SMTP_URL:-smtps://$SMTP_HOST:$SMTP_PORT}" >/dev/null 2>&1
+}
+
 # Remail a raw RFC822 file to $FORWARD_TO — the message lands as-received
 # (original From/Subject/body) so the ebay-mail-poller parses it natively.
 forward_msg(){ # eml_file
-  curl -s --connect-timeout 10 --max-time 60 \
-    --mail-from "mail-ops@theofficialblacksheepco.com" \
-    --mail-rcpt "$FORWARD_TO" \
-    -T "$1" \
-    "smtp://$SMTP_HOST:$SMTP_PORT" >/dev/null 2>&1
+  smtp_send "mail-ops@theofficialblacksheepco.com" "$FORWARD_TO" "$1"
+}
+
+# Deliver an alert as an actual email to the owner over the unit9 mail edge —
+# this is the fallback/primary notify path while matrix-relay is down. The
+# message body is read from stdin.
+send_alert_mail(){ # subject
+  local subj=$1 tmp
+  tmp=$(mktemp)
+  { printf 'From: ser.ops <mail-ops@theofficialblacksheepco.com>\r\n';
+    printf 'To: %s\r\n' "$OWNER_NOTIFY_EMAIL";
+    printf 'Subject: %s\r\n' "$subj";
+    printf 'Date: %s\r\n\r\n' "$(date -R)";
+    cat; printf '\r\n'; } > "$tmp"
+  smtp_send "mail-ops@theofficialblacksheepco.com" "$OWNER_NOTIFY_EMAIL" "$tmp"
+  local rc=$?; rm -f "$tmp"; return $rc
+}
+
+# Pull a short readable summary out of a raw RFC822 file for the digest and
+# owner alert — the point of the notification is to know WHAT the mail says,
+# not just that it arrived. Prefers the first MIME part (text/plain comes
+# first in multipart/alternative); falls back to the post-header body for
+# single-part mail; strips HTML tags, quoted-printable escapes, MIME residue.
+extract_excerpt(){ # eml_file -> one-line excerpt (<= ~320 chars)
+  local f=$1 b cte tmp=/tmp/ex.$$
+  b=$(sed -n 's/^[Cc]ontent-[Tt]ype:.*[Bb]oundary=["'"'"']*\([^"'"'"'; ]*\).*/\1/p' "$f" \
+      | head -1 | tr -d '\r')
+  if [ -n "$b" ]; then
+    awk -v b="--$b" -v out="$tmp" '
+      index($0,b)==1 { if(part) exit; part=1; ph=1; next }
+      part && ph && /^[Cc]ontent-[Tt]ransfer-[Ee]ncoding:/ { print > out".cte" }
+      part && ph && /^[ \t\r]*$/ { ph=0; next }
+      part && !ph { print > out }
+    ' "$f"
+    cte=$(cat "$tmp.cte" 2>/dev/null | tr -d '\r'); rm -f "$tmp.cte"
+    case "$cte" in *base64*|*BASE64*) base64 -d "$tmp" 2>/dev/null > "$tmp.d" && mv "$tmp.d" "$tmp";; esac
+  else
+    awk 'f{print} /^[ \t\r]*$/{f=1}' "$f" > "$tmp"
+    if grep -im1 '^Content-Transfer-Encoding: *base64' "$f" >/dev/null; then
+      base64 -d "$tmp" 2>/dev/null > "$tmp.d" && mv "$tmp.d" "$tmp"
+    fi
+  fi
+  grep -v '^--[A-Za-z0-9]' "$tmp" | sed 's/^Content-[A-Za-z-]*:.*//' \
+    | sed -e 's/<[^>]*>/ /g' -e 's/&nbsp;/ /g' -e 's/&amp;/\&/g' \
+          -e 's/=3D/=/g' -e 's/=[0-9A-Fa-f][0-9A-Fa-f]/ /g' -e 's/=$//' \
+    | tr '\n\t' '  ' | tr -d '\r' | tr -s ' ' \
+    | sed 's/^ *//;s/ *$//' | cut -c1-320
+  rm -f "$tmp"
 }
 
 # SQL string literal — same quoting helper as backup-volumes-db.sh.
@@ -173,6 +236,8 @@ ensure_schema(){
   crsql -d "$CR_DB" -e \
     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS msg_id STRING" >/dev/null 2>&1
   crsql -d "$CR_DB" -e \
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS excerpt STRING" >/dev/null 2>&1
+  crsql -d "$CR_DB" -e \
     "DROP INDEX IF EXISTS messages@messages_account_uid_key CASCADE" >/dev/null 2>&1
   crsql -d "$CR_DB" --format=csv -e "SHOW CONSTRAINTS FROM messages" 2>/dev/null \
     | grep -q messages_acct_fold_uid_key \
@@ -184,12 +249,12 @@ ensure_schema(){
 
 # Bare ON CONFLICT DO NOTHING (no arbiter) — skips rows violating whichever
 # unique constraint is live, so the mid-migration window is still safe.
-record_msg(){ # account folder uid from subject date action archive msg_id
+record_msg(){ # account folder uid from subject date action archive msg_id excerpt
   crsql -d "$CR_DB" -e "INSERT INTO messages
-      (unit, account, folder, uid, msg_from, subject, sent_raw, action, archive, msg_id)
+      (unit, account, folder, uid, msg_from, subject, sent_raw, action, archive, msg_id, excerpt)
     VALUES ($(sqlq "$UNIT_SELF"), $(sqlq "$1"), $(sqlq "$2"), $(sqlq "$3"),
             $(sqlq "$4"), $(sqlq "$5"), $(sqlq "$6"), $(sqlq "$7"),
-            $(sqlq "$8"), $(sqlq "$9"))
+            $(sqlq "$8"), $(sqlq "$9"), $(sqlq "${10:-}"))
     ON CONFLICT DO NOTHING" >/dev/null 2>&1
 }
 
@@ -324,7 +389,13 @@ sweep_folder(){
       rm -f "$msg_tmp"; continue
     fi
     cat "$msg_tmp" >> "$mbox_tmp"; total_arch=$((total_arch+1))
+    # Header FETCH can come back unparsable (that was the "blank notification"
+    # bug) — the full RFC822 is already on disk, so recover the fields from it.
+    [ -z "$from" ] && from=$(grep -im1 '^From:' "$msg_tmp" | sed 's/^From: *//;s/\r//')
+    [ -z "$subj" ] && subj=$(grep -im1 '^Subject:' "$msg_tmp" | sed 's/^Subject: *//;s/\r//')
+    [ -z "$subj" ] && subj="(no subject)"
     act=$(rule_action "$from" "$subj" "$name")
+    excerpt=$(extract_excerpt "$msg_tmp")
     mark=""
     if has_act "$act" forward; then
       if forward_msg "$msg_tmp"; then
@@ -345,12 +416,12 @@ sweep_folder(){
       mark="$mark[trashed]"
     elif has_act "$act" alert; then
       mark="$mark[ALERT]"
-      alerts="${alerts}${name}/${folder} | ${subj} | ${from}\n"
+      alerts="${alerts}${name}/${folder} | ${subj} | ${from}\n    ${excerpt}\n"
     fi
     rm -f "$msg_tmp"
-    digest="${digest}${name}/${folder} | ${subj} | ${from} ${mark}\n"
+    digest="${digest}${name}/${folder} | ${subj} | ${from} ${mark}\n    ${excerpt}\n"
     [ "$DB_OK" = 1 ] && record_msg "$name" "$folder" "$u" "$from" "$subj" \
-        "$date_raw" "$act" "$REMOTE_HOST:$REMOTE_DIR/$name/$month.mbox.gz" "$msg_id"
+        "$date_raw" "$act" "$REMOTE_HOST:$REMOTE_DIR/$name/$month.mbox.gz" "$msg_id" "$excerpt"
     echo "$u" >> "$seen_file"
     [ -n "$msg_id" ] && echo "$msg_id" >> "$msgid_file"
     n=$((n+1)); sf_new=$((sf_new+1)); total_new=$((total_new+1))
@@ -375,10 +446,12 @@ while IFS='|' read -r name host user pass trashfld folders; do
   done
 
   # ship the month's archive (append — decompress, concat, recompress)
+  # ssh MUST run -n here: it reads stdin, and stdin inside this loop is
+  # mail-accounts.conf — an interactive ssh eats the unprocessed account rows.
   if [ -s "$mbox_tmp" ]; then
     remote_file="$REMOTE_DIR/$name/$month.mbox.gz"
-    ssh $SSH_OPTS "$REMOTE_HOST" "mkdir -p ~/$REMOTE_DIR/$name" 2>/dev/null
-    { ssh $SSH_OPTS "$REMOTE_HOST" "zcat ~/$remote_file 2>/dev/null"; cat "$mbox_tmp"; } \
+    ssh -n $SSH_OPTS "$REMOTE_HOST" "mkdir -p ~/$REMOTE_DIR/$name" 2>/dev/null
+    { ssh -n $SSH_OPTS "$REMOTE_HOST" "zcat ~/$remote_file 2>/dev/null"; cat "$mbox_tmp"; } \
       | gzip -1 | ssh $SSH_OPTS "$REMOTE_HOST" "cat > ~/$remote_file.new && mv ~/$remote_file.new ~/$remote_file" \
       && log "$name: archived $sf_new msgs -> $remote_file" \
       || { mkdir -p "$LOCAL_DIR/$name"; cat "$mbox_tmp" | gzip -1 >> "$LOCAL_DIR/$name/$month.mbox.gz";
@@ -392,20 +465,28 @@ if [ "$total_new" -gt 0 ]; then
     "$STAMP" "$total_new" "$total_arch" "$total_fwd" "$total_trash" "$digest")"
 fi
 
-# Important mail -> owner. matrix-relay ESCALATE matches "MAIL ALERT" so this
-# fans out to Matrix + reech email (+SMS once Twilio KYC is done).
-MAIL_ALERT_URL=${MAIL_ALERT_URL:-http://100.64.118.105:5000/notify-owner}
+# Important mail -> owner. Two paths: an actual alert email over the unit9
+# mail edge (always — it carries the excerpts, so the owner reads WHAT came
+# in without opening the mailbox), and matrix-relay if one is configured.
+# matrix-relay ESCALATE matches "MAIL ALERT"; the old 100.64.118.105 relay is
+# gone from the tailnet, so MAIL_ALERT_URL stays empty unless a live relay
+# is pointed at.
+MAIL_ALERT_URL=${MAIL_ALERT_URL:-}
 if [ -n "$alerts" ]; then
-  n_alert=$(printf '%b' "$alerts" | grep -c .)
+  n_alert=$(printf '%b' "$alerts" | grep -c '|')
   body=$(printf "MAIL ALERT — %d important email(s) arrived:\n\n%b" "$n_alert" "$alerts")
-  # dispatcher image has no jq/python — escape JSON by hand
-  body_json=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' '\036' | sed 's/\x1e/\\n/g')
-  curl -s --connect-timeout 8 --max-time 15 -X POST "$MAIL_ALERT_URL" \
-    -H "Content-Type: application/json" \
-    -d "{\"text\": \"$body_json\"}" \
-    >/dev/null 2>&1 \
-    && log "alerted owner on $n_alert important message(s)" \
-    || log "WARN: owner mail alert failed (relay unreachable)"
+  printf '%s' "$body" | send_alert_mail "MAIL ALERT — $n_alert important email(s)" \
+    && log "alert mail sent to $OWNER_NOTIFY_EMAIL for $n_alert message(s)" \
+    || log "WARN: owner alert mail failed (SMTP $SMTP_HOST:$SMTP_PORT unreachable)"
+  if [ -n "$MAIL_ALERT_URL" ]; then
+    body_json=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' '\036' | sed 's/\x1e/\\n/g')
+    curl -s --connect-timeout 8 --max-time 15 -X POST "$MAIL_ALERT_URL" \
+      -H "Content-Type: application/json" \
+      -d "{\"text\": \"$body_json\"}" \
+      >/dev/null 2>&1 \
+      && log "also relayed alert to matrix-relay" \
+      || log "WARN: matrix-relay alert failed (relay unreachable)"
+  fi
 fi
 [ "$DB_OK" = 1 ] && record_sweep "$total_accts" "$total_new" "$total_arch" \
     "$total_trash" "swept $total_accts account(s), $total_fwd forwarded"

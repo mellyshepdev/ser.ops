@@ -43,6 +43,14 @@ RUN set -eux; \
         -G "$(getent group 1001 | cut -d: -f1)" \
         -h /home/swoopg111 -s /bin/bash swoopg111
 
+# unit4's scheduler compose pins user: "1006:1006" (host swoopg111 uid there),
+# same failure mode as above - bake the passwd entry for that uid too.
+RUN set -eux; \
+    getent group  1006 >/dev/null || addgroup -g 1006 serops; \
+    getent passwd 1006 >/dev/null || adduser -D -u 1006 \
+        -G "$(getent group 1006 | cut -d: -f1)" \
+        -h /home/swoopg111 -s /bin/sh serops
+
 ENV REPO=/srv/ser.ops \
     STATE_DIR=/srv/ser.ops/state
 
