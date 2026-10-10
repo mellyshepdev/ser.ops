@@ -12,9 +12,11 @@
 #
 # Remote: unit3:~/backups/db/<host>/<yyyymmdd>/. Local fallback if the
 # remote is unreachable. Nothing large stages on this disk.
-set -u
+set -uo pipefail
 
-HOST_TAG=$(hostname -s 2>/dev/null || echo unit7)
+# UNIT_NAME (ser.ops compose env) beats hostname — cloud VMs get provider
+# instance names like 'instance-20260928-204530' that pollute the unit3 tree.
+HOST_TAG=${UNIT_NAME:-$(hostname -s 2>/dev/null || echo unknown)}
 STAMP=$(date +%H%M%S)
 DAY=$(date +%Y%m%d)
 REMOTE_HOST=${REMOTE_HOST:-unit3-tailscale}
@@ -61,12 +63,30 @@ ship(){
   [ $ok -eq 1 ]
 }
 
+# Events land in the dashboard's own journal — serops_web.py reads
+# $STATE_DIR/events/<date>.jsonl. The old HTTP collector (unit7:50500) is
+# gone; posting to it silently dropped every event. Source lib/event.sh when
+# the repo is alongside us (local runs); on remote units the script ships
+# alone, so fall back to a raw jsonl line in a sibling events/ dir.
+LIB=${LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)}
+if [ -n "$LIB" ] && [ -f "$LIB/event.sh" ]; then
+  # plain assignments, not env-prefixes on `.` — prefix vars on a special
+  # builtin are temporary, so event.sh's `: "${VAR:=...}"` defaults saw them
+  # as set, skipped defaulting, and they vanished after source returned.
+  UNIT=${UNIT_NAME:-$HOST_TAG}
+  RUN_ID=serops-dbs-$$
+  . "$LIB/event.sh" 2>/dev/null || true
+fi
 emit_event(){
   local sev=$1 msg=$2
-  curl -s -m 5 -X POST "http://100.99.131.20:50500/api/event" \
-    -H 'content-type: application/json' \
-    -d "{\"type\":\"backup-dbs\",\"severity\":\"$sev\",\"message\":$(echo "$msg" | jq -R .)}" \
-    >/dev/null 2>&1 || true
+  if declare -F event >/dev/null 2>&1; then
+    event backup-dbs step "$msg" "" "" "$(detail_kv severity="$sev" 2>/dev/null || echo '{}')"
+  else
+    local d=${STATE_DIR:-$HOME/backups/db}/events
+    mkdir -p "$d" 2>/dev/null && printf '{"ts":"%s","unit":"%s","task":"backup-dbs","phase":"step","msg":"%s","detail":{"severity":"%s"}}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${HOST_TAG}" "$(printf '%s' "$msg" | tr -d '\"')" "$sev" >> "$d/$(date -u +%F).jsonl" 2>/dev/null
+  fi
+  return 0
 }
 
 # ---------- oversized postgres DBs ----------
@@ -263,14 +283,14 @@ for line in $containers; do
   fi
 
   # smallest first, same as postgres
-  dbs=$(docker exec "$name" mariadb -u root "-p$pw" -Nse \
+  dbs=$(docker exec -e MYSQL_PWD="$pw" "$name" mariadb -u root -Nse \
     "SELECT table_schema, COALESCE(SUM(data_length+index_length),0)
        FROM information_schema.tables
       WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys')
       GROUP BY table_schema ORDER BY 2" 2>/dev/null | awk '{print $1}')
   for db in $dbs; do
     log "$name: dumping $db"
-    docker exec "$name" "$dumper" -u root "-p$pw" --single-transaction --routines --triggers "$db" 2>/dev/null \
+    docker exec -e MYSQL_PWD="$pw" "$name" "$dumper" -u root --single-transaction --routines --triggers "$db" 2>/dev/null \
       | ship "${name}-${db}-${STAMP}.sql" \
       && manifest "$name" mariadb "$db" ok \
       || { manifest "$name" mariadb "$db" FAIL; fails=$((fails+1)); }
@@ -349,6 +369,27 @@ for line in $containers; do
     manifest "$name" cockroach - SKIP-backup-failed
   fi
 done
+
+# ---------- file extras ----------
+# Secrets that live outside any database — bao's unseal keys are the big one:
+# an openbao pg_dump without them is an unreadable brick. Per-host list,
+# missing paths skip quietly. LOCAL_EXTRAS overrides for ad-hoc runs.
+local_extras(){
+  case "$HOST_TAG" in
+    *[Uu]nit4*|instance-*) echo "/home/swoopg111/server/openbao/UNSEAL-KEEP-SAFE.json /home/swoopg111/server/openbao/config.hcl" ;;
+    *[Uu]nit2*)            echo "/etc/samba /var/lib/samba" ;;
+    *)               echo "" ;;
+  esac
+}
+_xtra="${LOCAL_EXTRAS:-$(local_extras)}"
+_present=""
+for _p in $_xtra; do [ -e "$_p" ] && _present="$_present $_p"; done
+if [ -n "${_present// /}" ]; then
+  log "file extras:${_present}"
+  tar cf - $_present 2>/dev/null | ship "${HOST_TAG}-fileextras-${STAMP}.tar" \
+    && manifest "$HOST_TAG" files extras ok \
+    || { manifest "$HOST_TAG" files extras FAIL; fails=$((fails+1)); }
+fi
 
 # ---------- manifest ----------
 mf="$LOCAL_DIR/manifest-$STAMP.txt"; mkdir -p "$LOCAL_DIR"

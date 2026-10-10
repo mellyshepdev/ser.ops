@@ -1,0 +1,37 @@
+# unit4 scheduler stack — docker-compose.unit4-web.yml deploys ONLY the
+# dashboard (serops_web.py); this is the missing dispatcher half (tick.sh →
+# rotate.sh). Standalone file: the base compose's ser-ops service carries
+# unit7-era mounts that do not exist on unit4 (.pgpass, /mnt/xvdbz1).
+#
+# Deploy: docker compose -f docker-compose.unit4-sched.yml up -d
+services:
+  ser-ops:
+    image: ser.ops:latest
+    container_name: ser-ops-sched
+    restart: unless-stopped
+    init: true
+    # unit4: swoopg111 is 1006:1006, docker group is gid 1001 (socket access)
+    user: "1006:1006"
+    group_add:
+      - "1001"
+    environment:
+      UNIT_NAME: "unit4"
+      REPO: /srv/ser.ops
+      STATE_DIR: /srv/ser.ops/state
+      SLOT_SECONDS: "${SLOT_SECONDS:-1800}"
+      TICK_SECONDS: "${TICK_SECONDS:-1800}"
+      HOME: /home/swoopg111
+    env_file:
+      - path: ./deploy/ser_ops.env
+        required: false
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/srv/ser.ops
+      - /home/swoopg111/backups:/home/swoopg111/backups
+      - /home/swoopg111/.ssh:/home/swoopg111/.ssh:ro
+    working_dir: /srv/ser.ops
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

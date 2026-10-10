@@ -233,8 +233,17 @@ order_parse(){ # account msg_file — silent unless a pattern fires
           | grep -ioE 'buyer[^a-z0-9_]{0,40}[a-z0-9_]+' \
           | grep -ivE 'buyer[^a-z0-9_]+(is|was|the|a|will|has|paid|can|still|now)' \
           | head -1 | sed -E 's/^[Bb]uyer[^A-Za-z0-9_]*//')
-  shipto=$(printf '%s' "$body" | grep -ioE 'ship to.{0,140}' | head -1 \
-           | sed -E 's/^[Ss]hip to *//;s/ (Package|package|Qty|Item|tracking|Tracking|Total).*$//' )
+  # eBay wraps it as buyer shipping-details in an itemKey cell — the old
+  # "ship to" anchor matched stray markup and stored raw HTML as the
+  # address. Fall back to the loose pattern for non-eBay mail.
+  shipto=$(printf %s "$body" | grep -ioE "shipping details:.{0,400}" | head -1 \
+           | sed -e "s/<[^>]*>//g" -e "s/&#\?[a-zA-Z0-9]\+;/ /g" -e "s/=[0-9A-Fa-f][0-9A-Fa-f]/ /g" -e "s/=[ ]*/ /g" \
+           | sed -E "s/^.*shipping details: *//I;s/\b(United States)\b.*$/\1/I;s/ (Ship by|Package|package|Qty|Item|tracking|Tracking|Total).*$//;s/[<].*$//" \
+           | tr -s " ")
+  [ -z "$shipto" ] && shipto=$(printf %s "$body" | grep -ioE "ship to.{0,140}" | head -1 \
+           | sed -E "s/^[Ss]hip to *//;s/ (Package|package|Qty|Item|tracking|Tracking|Total).*$//")
+  shipby=$(printf %s "$body" | grep -ioE "ship by:.{0,40}" | head -1 \
+           | sed -E "s/^[Ss]hip by: *//;s/ (Package|Qty|Item|tracking|Total).*$//")
   track=$(printf '%s' "$body" | grep -oE '1Z[0-9A-Z]{16}|9[0-9]{19,22}|TBA[0-9]{9,13}' | head -1)
   total=$(printf '%s' "$body" | grep -ioE 'total charged.{0,60}|order total.{0,60}|total:.{0,60}' | head -1 \
           | grep -oE '[0-9]+\.[0-9]{2}' | head -1)
@@ -243,13 +252,30 @@ order_parse(){ # account msg_file — silent unless a pattern fires
   esac
   itemname=$(printf '%s' "$subj" | sed -E 's/.*(made the sale for|emember to ship) //I')
 
-  # Sale email (item resolvable) vs shipping-only email.
-  if [ -n "$itemnum" ]; then
-    payload="{\"order_id\":\"$order\",\"buyer\":\"$buyer\",\"ship_to\":\"$shipto\",\"total\":\"$total\",\"items\":[{\"item_number\":\"$itemnum\",\"qty\":1,\"name\":\"$(printf '%s' "$itemname" | sed 's/"/\\"/g')\"}]}"
-  else
-    [ -z "$track" ] && [ -z "$buyer" ] && [ -z "$shipto" ] && return 0
-    payload="{\"order_id\":\"$order\",\"tracking_number\":\"$track\",\"carrier\":\"$carrier\",\"buyer\":\"$buyer\",\"ship_to\":\"$shipto\",\"total\":\"$total\"}"
+  # Sale email (item resolvable) vs shipping-only email. python3 builds the
+  # payload — sed-built JSON broke on quotes/backslashes in buyer names and
+  # item titles (the "Expecting , delimiter" rejects). Shipping-mode posts
+  # only when tracking or ship_to actually extracted: the API drops buyer-only
+  # payloads anyway (its gate wants tracking_number/buyer_email/ship_to).
+  if [ -z "$itemnum" ] && [ -z "$track" ] && [ -z "$shipto" ]; then
+    return 0
   fi
+  payload=$(ORDER="$order" ITEMNUM="$itemnum" ITEMNAME="$itemname" \
+            BUYER="$buyer" SHIPTO="$shipto" TRACK="$track" \
+            CARRIER="$carrier" TOTAL="$total" python3 - <<'PY'
+import json, os
+e = os.environ.get
+body = {"order_id": e("ORDER", ""), "buyer": e("BUYER", ""),
+        "ship_to": e("SHIPTO", ""), "total": e("TOTAL", "")}
+if e("ITEMNUM"):
+    body["items"] = [{"item_number": e("ITEMNUM"), "qty": 1,
+                      "name": e("ITEMNAME", "")}]
+else:
+    body["tracking_number"] = e("TRACK", "")
+    body["carrier"] = e("CARRIER", "")
+print(json.dumps(body))
+PY
+)
   resp=$(curl -s --max-time 15 -X POST "$INVENTORY_SALE_URL" \
         -H 'Content-Type: application/json' \
         -H "X-Admin-Key: $INVENTORY_ADMIN_KEY" \

@@ -26,9 +26,9 @@
 # its zones in a sqlite file on unit9, not in a container.
 set -u
 
-UNITS=${UNITS:-"unit2 unit9"}
+UNITS=${UNITS:-"unit2 unit9 unit10"}
 REMOTE_HOST=${REMOTE_HOST:-unit3}
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 SCRIPTS=$(cd "$(dirname "$0")" && pwd)
 LOCK=${LOCK:-/tmp/serops-backup-remote.lock}
 DAY=$(date +%Y%m%d)
@@ -41,9 +41,12 @@ log(){ echo "[$(date +%H:%M:%S)] $*"; }
 # Space-separated; missing paths are skipped rather than failing the run.
 extras_for(){
   case "$1" in
-    unit9) echo "/var/lib/powerdns/pdns.sqlite3 /etc/caddy /etc/dnsdist" ;;
-    unit2) echo "/home/swoopg111/server/networking/proxy/HAproxy/haproxy.cfg" ;;
-    *)     echo "" ;;
+    unit9)  echo "/var/lib/powerdns/pdns.sqlite3 /etc/caddy /etc/dnsdist" ;;
+    unit2)  echo "/home/swoopg111/server/networking/proxy/HAproxy/haproxy.cfg" ;;
+    # whole PVE config tree — CT/VM defs, storage, network. Small, and it is
+    # the only record of how CT100 (puffbase) is wired.
+    unit10) echo "/etc/pve" ;;
+    *)      echo "" ;;
   esac
 }
 
@@ -51,7 +54,7 @@ fails=0
 for unit in $UNITS; do
   log "=== $unit ==="
 
-  if ! ssh $SSH_OPTS "$unit" true 2>/dev/null; then
+  if ! ssh "${SSH_OPTS[@]}" "$unit" true 2>/dev/null; then
     log "  UNREACHABLE — skipping"
     fails=$((fails+1))
     continue
@@ -60,11 +63,11 @@ for unit in $UNITS; do
   # --- databases -------------------------------------------------------
   # The script is copied fresh each run so a fix here reaches every unit
   # without a separate deploy step.
-  if ssh $SSH_OPTS "$unit" "command -v docker >/dev/null 2>&1"; then
-    if scp $SSH_OPTS -q "$SCRIPTS/backup-dbs.sh" "$unit:/tmp/serops-backup-dbs.sh" 2>/dev/null; then
+  if ssh "${SSH_OPTS[@]}" "$unit" "command -v docker >/dev/null 2>&1"; then
+    if scp "${SSH_OPTS[@]}" -q "$SCRIPTS/backup-dbs.sh" "$unit:/tmp/serops-backup-dbs.sh" 2>/dev/null; then
       # REMOTE_HOST is passed through so the remote ships straight to unit3
       # rather than back here and out again.
-      if ssh $SSH_OPTS "$unit" \
+      if ssh "${SSH_OPTS[@]}" "$unit" \
            "chmod +x /tmp/serops-backup-dbs.sh && REMOTE_HOST='$REMOTE_HOST' LOCK=/tmp/serops-dbs.lock /tmp/serops-backup-dbs.sh" \
            2>&1 | sed "s/^/  [$unit] /"; then
         log "  databases ok"
@@ -72,7 +75,7 @@ for unit in $UNITS; do
         log "  databases FAILED"
         fails=$((fails+1))
       fi
-      ssh $SSH_OPTS "$unit" "rm -f /tmp/serops-backup-dbs.sh" 2>/dev/null
+      ssh "${SSH_OPTS[@]}" "$unit" "rm -f /tmp/serops-backup-dbs.sh" 2>/dev/null
     else
       log "  could not copy backup-dbs.sh"
       fails=$((fails+1))
@@ -86,12 +89,12 @@ for unit in $UNITS; do
   if [ -n "$extras" ]; then
     # Tar on the remote and stream straight to unit3. Nothing stages here,
     # and nothing large crosses unit7 at all.
-    present=$(ssh $SSH_OPTS "$unit" "for p in $extras; do [ -e \"\$p\" ] && printf '%s ' \"\$p\"; done" 2>/dev/null)
+    present=$(ssh "${SSH_OPTS[@]}" "$unit" "for p in $extras; do [ -e \"\$p\" ] && printf '%s ' \"\$p\"; done" 2>/dev/null)
     if [ -n "${present// /}" ]; then
       name="${unit}-extras-${DAY}-${STAMP}.tar.gz"
-      if ssh $SSH_OPTS "$unit" \
+      if ssh "${SSH_OPTS[@]}" "$unit" \
            "mkdir -p ~/.serops && sudo -n tar czf - $present 2>/dev/null || tar czf - $present 2>/dev/null" \
-         | ssh $SSH_OPTS "$REMOTE_HOST" "mkdir -p ~/backups/db/$unit/$DAY && cat > ~/backups/db/$unit/$DAY/$name"; then
+         | ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "mkdir -p ~/backups/db/$unit/$DAY && cat > ~/backups/db/$unit/$DAY/$name"; then
         log "  extras ok ($name)"
       else
         log "  extras FAILED"
