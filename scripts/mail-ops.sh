@@ -207,7 +207,7 @@ INVENTORY_ADMIN_KEY=${INVENTORY_ADMIN_KEY:-${SCANNER_ADMIN_KEY:-}}
 
 order_parse(){ # account msg_file — silent unless a pattern fires
   [ -z "$INVENTORY_SALE_URL" ] && return 0
-  local f=$2 subj body order itemnum buyer shipto track total carrier itemname
+  local f=$2 subj body order itemnums buyer shipto track total carrier itemname
   subj=$(grep -im1 '^Subject:' "$f" | sed 's/^Subject: *//;s/\r//')
   case "$subj" in
     *"made the sale"*|*"emember to ship"*|*"rder confirmed"*|*"rder details"*|\
@@ -222,26 +222,31 @@ order_parse(){ # account msg_file — silent unless a pattern fires
          | tr '\n\t' '  ' | tr -d '\r' | tr -s ' ')
   order=$(printf '%s' "$body" | grep -oE '[0-9]{2}-[0-9]{5}-[0-9]{5}' | head -1)
   [ -z "$order" ] && return 0
-  itemnum=$(printf '%s' "$body" | grep -ioE 'item number.{0,90}' | head -1 \
-            | grep -oE '[0-9]{10,14}' | head -1)
+  # eBay labels the listing id "Item Number", "Item ID:", "Item:&nbsp;<n>",
+  # and carries it in links as item=<n> or /itm/<n> — take them all. Multi-
+  # line orders post one items[] entry per id. Interval bounds must stay
+  # <=250: BusyBox grep (ser-ops container) rejects {0,400} as 'bad regex'.
+  itemnums=$(printf '%s' "$body" \
+            | grep -ioE 'item([ ]?(id|number|no)\.?|:)[^0-9]{0,60}[0-9]{9,14}|item [0-9]{9,14}|item=[0-9]{9,14}|/itm/[0-9]{9,14}' \
+            | grep -oE '[0-9]{9,14}' | sort -u | head -8 | tr '\n' ' ')
   # eBay lays fields out 'Item Number <n> Buyer <user> Qty' — anchor the buyer
-  # lookup after the item-number hit so 'buyer is waiting' doesn't match.
-  buyer=$(printf '%s' "$body" | grep -ioE 'item number.{0,250}' | head -1 \
-          | grep -ioE 'buyer[^a-z0-9_]{0,40}[a-z0-9_]+' | head -1 \
+  # lookup after the item hit so 'buyer is waiting' doesn't match.
+  buyer=$(printf '%s' "$body" | grep -ioE 'item([ ]?(id|number|no)\.?|:).{0,250}' | head -1 \
+          | grep -ioE 'buyer[^a-z0-9_]{0,40}[a-z0-9_]{3,}' | head -1 \
           | sed -E 's/^[Bb]uyer[^A-Za-z0-9_]*//')
   [ -z "$buyer" ] && buyer=$(printf '%s' "$body" \
-          | grep -ioE 'buyer[^a-z0-9_]{0,40}[a-z0-9_]+' \
+          | grep -ioE 'buyer[^a-z0-9_]{0,40}[a-z0-9_]{3,}' \
           | grep -ivE 'buyer[^a-z0-9_]+(is|was|the|a|will|has|paid|can|still|now)' \
           | head -1 | sed -E 's/^[Bb]uyer[^A-Za-z0-9_]*//')
   # eBay wraps it as buyer shipping-details in an itemKey cell — the old
   # "ship to" anchor matched stray markup and stored raw HTML as the
   # address. Fall back to the loose pattern for non-eBay mail.
-  shipto=$(printf %s "$body" | grep -ioE "shipping details:.{0,400}" | head -1 \
+  shipto=$(printf %s "$body" | grep -ioE "shipping details:.{0,250}" | head -1 \
            | sed -e "s/<[^>]*>//g" -e "s/&#\?[a-zA-Z0-9]\+;/ /g" -e "s/=[0-9A-Fa-f][0-9A-Fa-f]/ /g" -e "s/=[ ]*/ /g" \
-           | sed -E "s/^.*shipping details: *//I;s/\b(United States)\b.*$/\1/I;s/ (Ship by|Package|package|Qty|Item|tracking|Tracking|Total).*$//;s/[<].*$//" \
+           | sed -E "s/^.*shipping details: *//I;s/ United States.*$/ United States/I;s/ (Ship by|Package|Qty|Item|Tracking|Total).*$//I;s/[<].*$//" \
            | tr -s " ")
   [ -z "$shipto" ] && shipto=$(printf %s "$body" | grep -ioE "ship to.{0,140}" | head -1 \
-           | sed -E "s/^[Ss]hip to *//;s/ (Package|package|Qty|Item|tracking|Tracking|Total).*$//")
+           | sed -E "s/^[Ss]hip to *//;s/ (Package|package|Qty|Item|tracking|Tracking|Total).*$//;s/[<].*$//")
   shipby=$(printf %s "$body" | grep -ioE "ship by:.{0,40}" | head -1 \
            | sed -E "s/^[Ss]hip by: *//;s/ (Package|Qty|Item|tracking|Total).*$//")
   track=$(printf '%s' "$body" | grep -oE '1Z[0-9A-Z]{16}|9[0-9]{19,22}|TBA[0-9]{9,13}' | head -1)
@@ -251,25 +256,30 @@ order_parse(){ # account msg_file — silent unless a pattern fires
     1Z*) carrier="UPS" ;; 9*) carrier="USPS" ;; TBA*) carrier="Amazon" ;; *) carrier="" ;;
   esac
   itemname=$(printf '%s' "$subj" | sed -E 's/.*(made the sale for|emember to ship) //I')
+  salemail=""
+  case "$subj" in *"made the sale"*|*"emember to ship"*) salemail=1 ;; esac
 
   # Sale email (item resolvable) vs shipping-only email. python3 builds the
   # payload — sed-built JSON broke on quotes/backslashes in buyer names and
-  # item titles (the "Expecting , delimiter" rejects). Shipping-mode posts
-  # only when tracking or ship_to actually extracted: the API drops buyer-only
-  # payloads anyway (its gate wants tracking_number/buyer_email/ship_to).
-  if [ -z "$itemnum" ] && [ -z "$track" ] && [ -z "$shipto" ]; then
+  # item titles (the "Expecting , delimiter" rejects). Newer eBay sale mail
+  # has no item number at all — send a name-only items[] so the API can
+  # resolve the product title instead of degrading to a shipping post.
+  if [ -z "$itemnums" ] && [ -z "$track" ] && [ -z "$shipto" ] && [ -z "$salemail" ]; then
     return 0
   fi
-  payload=$(ORDER="$order" ITEMNUM="$itemnum" ITEMNAME="$itemname" \
-            BUYER="$buyer" SHIPTO="$shipto" TRACK="$track" \
-            CARRIER="$carrier" TOTAL="$total" python3 - <<'PY'
+  payload=$(ORDER="$order" ITEMNUMS="$itemnums" ITEMNAME="$itemname" \
+            SALEMAIL="$salemail" BUYER="$buyer" SHIPTO="$shipto" \
+            TRACK="$track" CARRIER="$carrier" TOTAL="$total" python3 - <<'PY'
 import json, os
 e = os.environ.get
 body = {"order_id": e("ORDER", ""), "buyer": e("BUYER", ""),
         "ship_to": e("SHIPTO", ""), "total": e("TOTAL", "")}
-if e("ITEMNUM"):
-    body["items"] = [{"item_number": e("ITEMNUM"), "qty": 1,
-                      "name": e("ITEMNAME", "")}]
+nums = [n for n in e("ITEMNUMS", "").split() if n.isdigit()]
+if nums:
+    body["items"] = [{"item_number": n, "qty": 1,
+                      "name": e("ITEMNAME", "")} for n in nums]
+elif e("SALEMAIL") and e("ITEMNAME"):
+    body["items"] = [{"qty": 1, "name": e("ITEMNAME", "")}]
 else:
     body["tracking_number"] = e("TRACK", "")
     body["carrier"] = e("CARRIER", "")
@@ -280,7 +290,10 @@ PY
         -H 'Content-Type: application/json' \
         -H "X-Admin-Key: $INVENTORY_ADMIN_KEY" \
         -d "$payload" 2>/dev/null)
-  log "$1: orderwatch $order -> ${resp:-no-response}"
+  local mode=item
+  [ -z "$itemnums" ] && [ -n "$salemail" ] && mode="NAME-ONLY"
+  [ -z "$itemnums" ] && [ -z "$salemail" ] && mode="NO-ITEM shipping-only"
+  log "$1: orderwatch $order [$mode] -> ${resp:-no-response}"
 }
 
 # SQL string literal — same quoting helper as backup-volumes-db.sh.
