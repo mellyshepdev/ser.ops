@@ -35,3 +35,30 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # Locator device alerts -> email / Slack / Matrix, polled every minute.
+  # Its own long-running service rather than a rotate.sh task: the scheduler
+  # ticks every 30 min, far too slow for "this phone is about to die".
+  # Script: scripts/locator-alerts.py (stdlib only); state in state/.
+  ser-ops-alerts:
+    image: ser.ops:latest
+    container_name: ser-ops-alerts
+    restart: unless-stopped
+    init: true
+    user: "1006:1006"
+    entrypoint: ["python3", "-u", "/srv/ser.ops/scripts/locator-alerts.py"]
+    environment:
+      STATE_DIR: /srv/ser.ops/state
+      LOCATOR_URL: "http://100.123.158.58:50500"
+      ALERT_POLL_SECONDS: "60"
+    env_file:
+      - path: ./deploy/ser_ops.env
+        required: false
+    volumes:
+      - .:/srv/ser.ops
+    working_dir: /srv/ser.ops
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
