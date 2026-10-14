@@ -26,7 +26,7 @@
 # its zones in a sqlite file on unit9, not in a container.
 set -u
 
-UNITS=${UNITS:-"unit2 unit9 unit10"}
+UNITS=${UNITS:-"unit2 unit8 unit9 unit10"}
 REMOTE_HOST=${REMOTE_HOST:-unit3}
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 SCRIPTS=$(cd "$(dirname "$0")" && pwd)
@@ -42,11 +42,23 @@ log(){ echo "[$(date +%H:%M:%S)] $*"; }
 extras_for(){
   case "$1" in
     unit9)  echo "/var/lib/powerdns/pdns.sqlite3 /etc/caddy /etc/dnsdist" ;;
-    unit2)  echo "/home/swoopg111/server/networking/proxy/HAproxy/haproxy.cfg" ;;
+    unit2)  echo "/home/admin/edge" ;;
     # whole PVE config tree — CT/VM defs, storage, network. Small, and it is
-    # the only record of how CT100 (puffbase) is wired.
-    unit10) echo "/etc/pve" ;;
+    # the only record of how CT100 (puffbase) is wired. /srv/puffbase holds
+    # CT100's crdb-data + backup mounts.
+    unit10) echo "/etc/pve /srv/puffbase/backup" ;;
     *)      echo "" ;;
+  esac
+}
+
+# Root-owned paths the ssh user can't read — tar them through a container
+# (docker socket = root-equivalent). Format per line: <path>|<image already
+# on that host>. Missing image/path skips rather than fails.
+cextras_for(){
+  case "$1" in
+    unit8)  printf '/srv/clusterfs/matrix|postgres:16-alpine\n' ;;
+    unit9)  printf '/opt/traccar|mariadb:11.4\n' ;;
+    *)      : ;;
   esac
 }
 
@@ -64,18 +76,20 @@ for unit in $UNITS; do
   # The script is copied fresh each run so a fix here reaches every unit
   # without a separate deploy step.
   if ssh "${SSH_OPTS[@]}" "$unit" "command -v docker >/dev/null 2>&1"; then
-    if scp "${SSH_OPTS[@]}" -q "$SCRIPTS/backup-dbs.sh" "$unit:/tmp/serops-backup-dbs.sh" 2>/dev/null; then
+    # Drop in $HOME — /tmp isn't reliably writable for the ssh user on
+    # every unit (unit2's /tmp is another uid's).
+    if scp "${SSH_OPTS[@]}" -q "$SCRIPTS/backup-dbs.sh" "$unit:serops-backup-dbs.sh" 2>/dev/null; then
       # REMOTE_HOST is passed through so the remote ships straight to unit3
       # rather than back here and out again.
       if ssh "${SSH_OPTS[@]}" "$unit" \
-           "chmod +x /tmp/serops-backup-dbs.sh && REMOTE_HOST='$REMOTE_HOST' LOCK=/tmp/serops-dbs.lock /tmp/serops-backup-dbs.sh" \
+           "chmod +x ~/serops-backup-dbs.sh && TMPDIR=\"\$HOME\" REMOTE_HOST='$REMOTE_HOST' LOCK=\"\$HOME/serops-dbs.lock\" ~/serops-backup-dbs.sh" \
            2>&1 | sed "s/^/  [$unit] /"; then
         log "  databases ok"
       else
         log "  databases FAILED"
         fails=$((fails+1))
       fi
-      ssh "${SSH_OPTS[@]}" "$unit" "rm -f /tmp/serops-backup-dbs.sh" 2>/dev/null
+      ssh "${SSH_OPTS[@]}" "$unit" "rm -f ~/serops-backup-dbs.sh" 2>/dev/null
     else
       log "  could not copy backup-dbs.sh"
       fails=$((fails+1))
@@ -102,6 +116,44 @@ for unit in $UNITS; do
       fi
     else
       log "  no extras present"
+    fi
+  fi
+
+  # --- container-tar extras (root-owned state) ------------------------------
+  for ce in $(cextras_for "$unit"); do
+    cpath=${ce%%|*}; cimg=${ce##*|}
+    [ -z "$cpath" ] && continue
+    name="${unit}-$(basename "$cpath" | tr '/ ' '__')-${DAY}-${STAMP}.tar.gz"
+    if ssh "${SSH_OPTS[@]}" "$unit" \
+         "docker run --rm -v '$cpath':/src:ro '$cimg' tar czf - -C /src . 2>/dev/null" \
+       | ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "mkdir -p ~/backups/db/$unit/$DAY && cat > ~/backups/db/$unit/$DAY/$name"; then
+      log "  cextra ok ($name)"
+    else
+      log "  cextra FAILED ($cpath)"
+      fails=$((fails+1))
+    fi
+  done
+
+  # --- puffbase CockroachDB (CT100 on unit10) --------------------------------
+  # No ssh into the CT — drive it through pct exec on the hypervisor. BACKUP
+  # lands under --external-io-dir=/backup (host /srv/puffbase/backup in the
+  # CT), tarred out, shipped, cleaned.
+  if [ "$unit" = "unit10" ]; then
+    crdb_rel="serops-${DAY}-${STAMP}"
+    if ssh "${SSH_OPTS[@]}" "$unit" \
+         "pct exec 100 -- docker exec puffbase-cockroach cockroach sql --insecure -e \"BACKUP INTO 'nodelocal://1/$crdb_rel'\"" 2>/dev/null; then
+      name="unit10-puffbase-crdb-${DAY}-${STAMP}.tar.gz"
+      if ssh "${SSH_OPTS[@]}" "$unit" "pct exec 100 -- tar czf - -C /srv/puffbase/backup '$crdb_rel'" \
+         | ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "mkdir -p ~/backups/db/unit10-crdb/$DAY && cat > ~/backups/db/unit10-crdb/$DAY/$name"; then
+        log "  puffbase-crdb ok ($name)"
+        ssh "${SSH_OPTS[@]}" "$unit" "pct exec 100 -- rm -rf '/srv/puffbase/backup/$crdb_rel'" 2>/dev/null
+      else
+        log "  puffbase-crdb tar/ship FAILED"
+        fails=$((fails+1))
+      fi
+    else
+      log "  puffbase-crdb BACKUP failed"
+      fails=$((fails+1))
     fi
   fi
 done

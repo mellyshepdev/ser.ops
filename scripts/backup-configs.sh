@@ -22,12 +22,18 @@ exec 9>"$LOCK"
 flock -n 9 || { echo "backup-configs already running"; exit 0; }
 
 # --- unit targets ------------------------------------------------------------
+# Format: name|ssh-target[|extra_dirs]. extra_dirs are absolute paths searched
+# in addition to ~/$SEARCH_DIRS — for roots like /etc/pve that live outside a
+# home dir. puffbase-vm has no inbound ssh — its project dir ships via
+# backup-puffbase-vm.sh (lokey exec channel) instead.
 UNITS=(
-  "unit7|local"
+  "unit4|local"
   "unit2|ssh -o BatchMode=yes -o ConnectTimeout=8 unit2"
-  "unit3|ssh -o BatchMode=yes -o ConnectTimeout=8 -i $HOME/.ssh/id_ed25519 swoopggainz@100.78.95.13"
-  "unit6|ssh -o BatchMode=yes -o ConnectTimeout=8 -i $HOME/.ssh/id_ed25519 swoopg111@100.66.180.60"
-  "unit9|ssh -o BatchMode=yes -o ConnectTimeout=8 -i $HOME/.ssh/id_ed25519_mesh root@100.94.170.118"
+  "unit3|ssh -o BatchMode=yes -o ConnectTimeout=8 unit3"
+  "unit6|ssh -o BatchMode=yes -o ConnectTimeout=8 unit6"
+  "unit8|ssh -o BatchMode=yes -o ConnectTimeout=8 unit8"
+  "unit9|ssh -o BatchMode=yes -o ConnectTimeout=8 root@unit9"
+  "unit10|ssh -o BatchMode=yes -o ConnectTimeout=8 root@unit10|/etc/pve"
 )
 
 # Directories searched on each unit, relative to ~
@@ -41,7 +47,8 @@ sqlq() { printf "%s" "$1" | sed "s/'/''/g"; }
 total_new=0
 for entry in "${UNITS[@]}"; do
   unit="${entry%%|*}"
-  target="${entry#*|}"
+  target=$(printf '%s' "$entry" | cut -d'|' -f2)
+  extra_dirs=$(printf '%s' "$entry" | cut -d'|' -f3-)
   echo "=== $unit ==="
 
   paths=""
@@ -52,6 +59,11 @@ for entry in "${UNITS[@]}"; do
     else
       found=$($target "[ -d \$HOME/$d ] && ${REMOTE_FIND/DIR/\$HOME/$d}" 2>/dev/null)
     fi
+    [ -n "$found" ] && paths="$paths
+$found"
+  done
+  for d in $extra_dirs; do
+    found=$($target "[ -d '$d' ] && ${REMOTE_FIND/DIR/\'$d\'}" 2>/dev/null)
     [ -n "$found" ] && paths="$paths
 $found"
   done

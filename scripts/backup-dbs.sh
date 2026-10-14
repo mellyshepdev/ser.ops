@@ -406,8 +406,15 @@ if [ $REMOTE_OK -eq 1 ]; then
   for d in "$HOME"/backups/db/*/; do
     [ -d "$d" ] || continue
     day=$(basename "$d")
-    if rsync -a --timeout=120 -e "ssh $SSH_OPTS" "$d" \
-        "$REMOTE_HOST:backups/db/${HOST_TAG}/" 2>/dev/null; then
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --timeout=120 -e "ssh $SSH_OPTS" "$d" \
+          "$REMOTE_HOST:backups/db/${HOST_TAG}/" 2>/dev/null
+    else
+      # no rsync on this unit — stream the day dir over ssh instead
+      tar czf - -C "$d" . | ssh $SSH_OPTS "$REMOTE_HOST" \
+          "mkdir -p ~/backups/db/${HOST_TAG}/$day && tar xzf - -C ~/backups/db/${HOST_TAG}/$day"
+    fi
+    if [ $? -eq 0 ]; then
       rm -rf "$d" && log "flushed staged day $day -> unit3"
     else
       log "WARN flush of $day failed — left in place"
