@@ -39,7 +39,10 @@ touch "$DONE_FILE"
 
 # host|abs_path — ssh aliases resolve over tailscale; rclone must exist on
 # the remote (unit3 got ~/bin/rclone on 2026-10-17, linux units ~/.local/bin).
+# op is move (drain to Drive, free the source) or copy (Drive mirrors the
+# backup store — unit3 keeps hot backups, Drive keeps deep archive).
 TARGETS=(
+    "unit3-tailscale|/Users/swoopggainz/backups|copy"
     "unit10|/var/lib/vz/dump"
     "unit10|/var/lib/vz/template/iso"
     "unit3-tailscale|/Users/swoopggainz/_archive"
