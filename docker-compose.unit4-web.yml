@@ -17,6 +17,7 @@ services:
       STATE_DIR: /srv/ser.ops/state
       SEROPS_BIND: "0.0.0.0"
       SEROPS_PORT: "8137"
+      UNIT_NAME: "unit4"
     ports:
       - "100.123.158.58:8137:8137"
     command: ["python3", "/srv/ser.ops/web/serops_web.py"]
