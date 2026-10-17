@@ -50,6 +50,9 @@ EXCLUDE_PATTERNS=(
   '^/var/run/docker\.sock'       # the socket is not data
   '^/etc/(os-release|timezone|localtime)$'
   '^/proc|^/sys|^/dev'
+  '^/home/[^/]+/backups(/|$)'
+  '^/root/backups(/|$)'
+  'puffbase'
 )
 
 mkdir -p "$BACKUP_DIR" "$STATE_DIR"
@@ -205,6 +208,68 @@ log "volume backup start (remote=$([ $REMOTE_OK -eq 1 ] && echo "$BACKUP_HOST:$R
 
 total=0; ok=0; failed=0; skipped=0
 declare -A SEEN=()
+declare -A SEEN_GIT=()
+GIT_HELPER_IMAGE="${GIT_HELPER_IMAGE:-ser.ops:latest}"
+
+# Run a shell snippet with host filesystem + ssh keys so git can inspect,
+# commit, and push host repositories even when backup-volumes.sh runs inside
+# the ser-ops-sched container.
+host_git_sh() {
+    if [ -d "$HOME/projects" ] && [ ! -f /.dockerenv ]; then
+        sh -c "$1"
+    else
+        docker run --rm --entrypoint sh -u "$(id -u):$(id -g)" \
+            -e HOME="$HOME" -v "$HOME:$HOME" "$GIT_HELPER_IMAGE" -c "$1"
+    fi
+}
+
+# Check if bind mount $1 is inside a non-ignored git worktree; if so, print
+# the repo top-level path, else return 1.
+git_repo_for_mount() {
+    local src=$1
+    host_git_sh "
+        src=$(printf %q "$src")
+        [ -e \"\$src\" ] || exit 1
+        d=\"\$src\"
+        [ -f \"\$d\" ] && d=\$(dirname \"\$d\")
+        top=\$(git -c safe.directory=\"*\" -C \"\$d\" rev-parse --show-toplevel 2>/dev/null) || exit 1
+        [ -n \"\$top\" ] || exit 1
+        if [ \"\$src\" != \"\$top\" ] && git -c safe.directory=\"*\" -C \"\$top\" check-ignore -q \"\$src\" 2>/dev/null; then
+            exit 1
+        fi
+        printf "%s" \"\$top\"
+    " 2>/dev/null
+}
+
+# Commit and push any changes in git repo $1 instead of tarring it to unit3.
+sync_git_repo() {
+    local top=$1
+    host_git_sh "
+        set -u
+        top=$(printf %q "$top")
+        cd \"\$top\" || exit 1
+        rem=\$(git remote 2>/dev/null | head -1)
+        [ -n \"\$rem\" ] || { echo no-remote; exit 0; }
+        dirty=\$(git status --porcelain 2>/dev/null || true)
+        committed=0
+        if [ -n \"\$dirty\" ]; then
+            git config user.name >/dev/null 2>&1 || git config user.name \"ser.ops\"
+            git config user.email >/dev/null 2>&1 || git config user.email \"ser.ops@${UNIT}\"
+            git add -A 2>/dev/null || true
+            git commit -m \"auto(ser.ops): ${UNIT} \$(date -u +'%Y-%m-%d %H:%M')\" --no-verify >/dev/null 2>&1 && committed=1 || true
+        fi
+        ahead=\$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
+        if [ \"\$committed\" -eq 1 ] || [ \"\$ahead\" -gt 0 ]; then
+            pushed=0
+            for r in \$(git remote 2>/dev/null); do
+                git push \"\$r\" HEAD >/dev/null 2>&1 && pushed=1 || true
+            done
+            [ \"\$pushed\" -eq 1 ] && echo pushed || echo push-failed
+        else
+            echo clean
+        fi
+    " 2>/dev/null
+}
 
 # ONLY_CONTAINERS="a b c" limits the sweep — used for tests and for pulling
 # a single service's state on demand.
@@ -222,10 +287,25 @@ for cid in $(docker ps -aq); do
     [ -n "$mounts" ] && log "container $cname"
     while IFS='|' read -r mtype src dest vname; do
         [ -n "$src" ] || continue
-        if excluded "$src"; then
+        if excluded "$src" || { [ -n "$vname" ] && excluded "$vname"; }; then
             log "  skip $cname $dest ($src — excluded)"
             manifest "$cname" "$mtype" "$src" "$dest" "-" "skip-excluded"
             skipped=$((skipped+1)); continue
+        fi
+        # Git repositories: commit and push instead of tarring as a volume backup.
+        if [ "$mtype" = "bind" ]; then
+            if git_top=$(git_repo_for_mount "$src") && [ -n "$git_top" ]; then
+                if [ -n "${SEEN_GIT[$git_top]:-}" ]; then
+                    log "  skip $cname $dest — git repo $git_top already synced via ${SEEN_GIT[$git_top]}"
+                    manifest "$cname" "$mtype" "$src" "$dest" "git:$git_top" "skip-git-via-${SEEN_GIT[$git_top]}"
+                    skipped=$((skipped+1)); continue
+                fi
+                SEEN_GIT[$git_top]=$cname
+                git_state=$(sync_git_repo "$git_top")
+                log "  git $cname $dest ($git_top -> ${git_state:-synced})"
+                manifest "$cname" "$mtype" "$src" "$dest" "git:$git_top" "git-${git_state:-synced}"
+                skipped=$((skipped+1)); continue
+            fi
         fi
         # Same volume attached to several containers → back it up once.
         if [ "$mtype" = "volume" ]; then
@@ -266,6 +346,11 @@ for vol in $(docker volume ls -q); do
     [ -n "${SEEN[$vol]:-}" ] && continue
     src=$(docker volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null)
     [ -n "$src" ] || continue
+    if excluded "$src" || excluded "$vol"; then
+        log "  skip _unattached $vol ($src — excluded)"
+        manifest "_unattached" "volume" "$src" "$vol" "-" "skip-excluded"
+        skipped=$((skipped+1)); continue
+    fi
     if [ "$MIN_MOUNT_MB" -gt 0 ] || [ "$MAX_MOUNT_MB" -gt 0 ]; then
         size_mb=$(mount_size_mb "$src")
         { [ "$MIN_MOUNT_MB" -gt 0 ] && [ "$size_mb" -lt "$MIN_MOUNT_MB" ]; } && continue

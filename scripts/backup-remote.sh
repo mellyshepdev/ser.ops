@@ -46,7 +46,7 @@ extras_for(){
     # whole PVE config tree — CT/VM defs, storage, network. Small, and it is
     # the only record of how CT100 (puffbase) is wired. /srv/puffbase holds
     # CT100's crdb-data + backup mounts.
-    unit10) echo "/etc/pve /srv/puffbase/backup" ;;
+    unit10) echo "/etc/pve" ;;
     *)      echo "" ;;
   esac
 }
@@ -98,12 +98,42 @@ for unit in $UNITS; do
     log "  no docker — skipping container dumps"
   fi
 
-  # --- file-level extras ----------------------------------------------
+  # --- git repositories (commit & push instead of tar backups) --------
+  ssh "${SSH_OPTS[@]}" "$unit" '
+    for repo in "$HOME"/projects/* "$HOME"/*-app "$HOME"/*-src /root/projects/* /root/*-app /root/*-src; do
+      [ -d "$repo/.git" ] || continue
+      git -c safe.directory="*" -C "$repo" rev-parse --show-toplevel >/dev/null 2>&1 || continue
+      rem=$(git -c safe.directory="*" -C "$repo" remote 2>/dev/null | head -1)
+      [ -n "$rem" ] || continue
+      if [ -n "$(git -c safe.directory="*" -C "$repo" status --porcelain 2>/dev/null)" ]; then
+        git -c safe.directory="*" -C "$repo" config user.name >/dev/null 2>&1 || git -c safe.directory="*" -C "$repo" config user.name "ser.ops"
+        git -c safe.directory="*" -C "$repo" config user.email >/dev/null 2>&1 || git -c safe.directory="*" -C "$repo" config user.email "ser.ops@$(hostname -s 2>/dev/null || echo unit)"
+        git -c safe.directory="*" -C "$repo" add -A 2>/dev/null || true
+        git -c safe.directory="*" -C "$repo" commit -m "auto(ser.ops): $(hostname -s 2>/dev/null || echo unit) $(date -u +"%Y-%m-%d %H:%M")" --no-verify >/dev/null 2>&1 || true
+      fi
+      ahead=$(git -c safe.directory="*" -C "$repo" rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
+      if [ "$ahead" -gt 0 ]; then
+        for r in $(git -c safe.directory="*" -C "$repo" remote 2>/dev/null); do
+          git -c safe.directory="*" -C "$repo" push "$r" HEAD >/dev/null 2>&1 || true
+        done
+      fi
+    done
+  ' 2>/dev/null && log "  git repos synced" || true
+
+  # --- file-level extras (non-git paths only) -------------------------
   extras=$(extras_for "$unit")
   if [ -n "$extras" ]; then
-    # Tar on the remote and stream straight to unit3. Nothing stages here,
-    # and nothing large crosses unit7 at all.
-    present=$(ssh "${SSH_OPTS[@]}" "$unit" "for p in $extras; do [ -e \"\$p\" ] && printf '%s ' \"\$p\"; done" 2>/dev/null)
+    # Filter out any path that is a git worktree (committed & pushed above instead of tarred).
+    present=$(ssh "${SSH_OPTS[@]}" "$unit" "
+      for p in $extras; do
+        [ -e \"\$p\" ] || continue
+        d=\"\$p\"; [ -f \"\$d\" ] && d=\$(dirname \"\$d\")
+        if git -c safe.directory=\"*\" -C \"\$d\" rev-parse --show-toplevel >/dev/null 2>&1; then
+          continue
+        fi
+        printf '%s ' \"\$p\"
+      done
+    " 2>/dev/null)
     if [ -n "${present// /}" ]; then
       name="${unit}-extras-${DAY}-${STAMP}.tar.gz"
       if ssh "${SSH_OPTS[@]}" "$unit" \
@@ -115,7 +145,7 @@ for unit in $UNITS; do
         fails=$((fails+1))
       fi
     else
-      log "  no extras present"
+      log "  no non-git extras present"
     fi
   fi
 
@@ -133,29 +163,6 @@ for unit in $UNITS; do
       fails=$((fails+1))
     fi
   done
-
-  # --- puffbase CockroachDB (CT100 on unit10) --------------------------------
-  # No ssh into the CT — drive it through pct exec on the hypervisor. BACKUP
-  # lands under --external-io-dir=/backup (host /srv/puffbase/backup in the
-  # CT), tarred out, shipped, cleaned.
-  if [ "$unit" = "unit10" ]; then
-    crdb_rel="serops-${DAY}-${STAMP}"
-    if ssh "${SSH_OPTS[@]}" "$unit" \
-         "pct exec 100 -- docker exec puffbase-cockroach cockroach sql --insecure -e \"BACKUP INTO 'nodelocal://1/$crdb_rel'\"" 2>/dev/null; then
-      name="unit10-puffbase-crdb-${DAY}-${STAMP}.tar.gz"
-      if ssh "${SSH_OPTS[@]}" "$unit" "pct exec 100 -- tar czf - -C /srv/puffbase/backup '$crdb_rel'" \
-         | ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "mkdir -p ~/backups/db/unit10-crdb/$DAY && cat > ~/backups/db/unit10-crdb/$DAY/$name"; then
-        log "  puffbase-crdb ok ($name)"
-        ssh "${SSH_OPTS[@]}" "$unit" "pct exec 100 -- rm -rf '/srv/puffbase/backup/$crdb_rel'" 2>/dev/null
-      else
-        log "  puffbase-crdb tar/ship FAILED"
-        fails=$((fails+1))
-      fi
-    else
-      log "  puffbase-crdb BACKUP failed"
-      fails=$((fails+1))
-    fi
-  fi
 done
 
 log "done — $fails failure(s)"

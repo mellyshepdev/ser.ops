@@ -1,0 +1,4 @@
+# Exclude puffbase volumes/mounts (tracked in git) and backup staging dirs
+puffbase
+^/home/[^/]+/backups(/|$)
+^/root/backups(/|$)
