@@ -60,6 +60,21 @@ trap 'rm -f "$LIST" "$ERR"' EXIT
 # same tree, and moving one mid-write cuts off a running job's output.
 ( cd "$SOURCE_DIR" && find . -type f ! -name '*.log' -mmin "+$MIN_AGE_MIN" -print ) \
     > "$LIST" 2>/dev/null
+
+# Chunk the sweep: cap the batch at MAX_SWEEP_BYTES so a run finishes inside
+# its task budget instead of being SIGKILLed mid-file. Files skipped this run
+# are still past MIN_AGE_MIN next run — the backlog drains over consecutive
+# ticks. A single oversized file always gets through (can't be split anyway).
+MAX_SWEEP_BYTES="${MAX_SWEEP_BYTES:-4294967296}"
+if [ "${MAX_SWEEP_BYTES:-0}" -gt 0 ]; then
+    LIST_CAP=$(mktemp); total=0
+    while IFS= read -r f; do
+        sz=$( stat -c %s "$SOURCE_DIR/$f" 2>/dev/null || echo 0 )
+        if [ $((total + sz)) -gt "$MAX_SWEEP_BYTES" ] && [ "$total" -gt 0 ]; then break; fi
+        printf '%s\n' "$f" >> "$LIST_CAP"; total=$((total + sz))
+    done < "$LIST"
+    mv "$LIST_CAP" "$LIST"
+fi
 count=$(wc -l < "$LIST" | tr -d ' ')
 
 if [ "$count" -eq 0 ]; then
