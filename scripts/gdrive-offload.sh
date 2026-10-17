@@ -11,7 +11,7 @@
 # OFFLOAD_DELETE=0 runs `rclone copy` instead — additive verify pass, sources
 # stay put.
 #
-# Deliberately NOT included: unit3:~/backups (that IS the backup store), any
+# unit3:~/backups rides in copy mode (Drive mirrors it); still excluded: any
 # live VM disk images under /var/lib/vz/images, anything mounted.
 
 set -uo pipefail
@@ -50,13 +50,18 @@ TARGETS=(
     "unit3-tailscale|/Users/swoopggainz/Movies"
 )
 
-for t in "${TARGETS[@]}"; do
-    IFS="|" read -r host path <<< "$t"
+ROT_FILE="$STATE_DIR/gdrive-offload.rot"; LAST_IDX=-1
+[ -f "$ROT_FILE" ] && LAST_IDX=$(cat "$ROT_FILE" 2>/dev/null || echo -1)
+N=${#TARGETS[@]}
+for off in $(seq 1 $N); do
+    i=$(( (LAST_IDX + off) % N ))
+    t="${TARGETS[$i]}"
+    IFS="|" read -r host path target_op <<< "$t"
     key="$host:$path"
     grep -qxF "$key" "$DONE_FILE" && continue
     name=$(basename "$path")
 
-    op=move; [ "$OFFLOAD_DELETE" = "0" ] && op=copy
+    op=${target_op:-move}; [ "$OFFLOAD_DELETE" = "0" ] && op=copy
     dest="$REMOTE/${host%%-tailscale}/$name"
     log "start $key -> $dest ($op, cap $MAX_TRANSFER)"
     event "ser.ops" "gdrive_offload_start" || :
@@ -76,6 +81,7 @@ for t in "${TARGETS[@]}"; do
         log "FAILED $key"
         event "ser.ops-failed" "gdrive_offload_fail" || :
     fi
+    echo "$i" > "$ROT_FILE"
     exit 0   # one target per tick — the rotation calls us again in 30 min
 done
 
