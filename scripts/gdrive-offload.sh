@@ -13,6 +13,13 @@
 #
 # unit3:~/backups rides in copy mode (Drive mirrors it); still excluded: any
 # live VM disk images under /var/lib/vz/images, anything mounted.
+#
+# Fleet flow (SwoopG, 2026-10-22): every unit's ser.ops ships dumps to unit3;
+# from unit3, dumps older than ARCHIVE_AGE move on to the 5TB Drive. The
+# "move-old" op does that for unit3's db/ and volumes/ trees: rclone move
+# --min-age, so recent restore points stay hot on unit3 and only aged ones
+# leave. Those targets are never watermarked — new dumps age in every day.
+ARCHIVE_AGE="${ARCHIVE_AGE:-14d}"
 
 set -uo pipefail
 
@@ -42,6 +49,9 @@ touch "$DONE_FILE"
 # op is move (drain to Drive, free the source) or copy (Drive mirrors the
 # backup store — unit3 keeps hot backups, Drive keeps deep archive).
 TARGETS=(
+    "unit3-tailscale|/Users/swoopggainz/backups/db|move-old"
+    "unit3-tailscale|/Users/swoopggainz/backups/volumes|move-old"
+    "unit3-tailscale|/Users/swoopggainz/backups/swept|move-old"
     "unit3-tailscale|/Users/swoopggainz/backups|copy"
     "unit10|/var/lib/vz/dump"
     "unit10|/var/lib/vz/template/iso"
@@ -63,14 +73,26 @@ for off in $(seq 1 $N); do
 
     op=${target_op:-move}; [ "$OFFLOAD_DELETE" = "0" ] && op=copy
     dest="$REMOTE/${host%%-tailscale}/$name"
+    extra=""
+    if [ "$op" = move-old ]; then
+        # land beside the copy-mode mirror (backups/<name>) so Drive has one
+        # tree per dump set; source dirs emptied by the move are pruned
+        op=move; extra="--min-age $ARCHIVE_AGE --delete-empty-src-dirs"
+        dest="$REMOTE/${host%%-tailscale}/backups/$name"
+        [ "$OFFLOAD_DELETE" = "0" ] && { op=copy; extra="--min-age $ARCHIVE_AGE"; }
+        aged=1
+    else
+        aged=0
+    fi
     log "start $key -> $dest ($op, cap $MAX_TRANSFER)"
     event "ser.ops" "gdrive_offload_start" || :
 
     if ssh -o BatchMode=yes -o ConnectTimeout=15 "$host" \
         "RCLONE=\$(command -v rclone || echo \$HOME/bin/rclone); command -v \$RCLONE >/dev/null || RCLONE=\$HOME/.local/bin/rclone; \
-         \$RCLONE $op $(printf %q "$path") $(printf %q "$dest") --max-transfer $MAX_TRANSFER --transfers 4 --checkers 4" ; then
-        # empty source after a move = target fully drained
-        if [ "$op" = move ] && ssh -o BatchMode=yes "$host" "[ -z \"\$(ls -A $(printf %q "$path") 2>/dev/null)\" ]"; then
+         \$RCLONE $op $(printf %q "$path") $(printf %q "$dest") --max-transfer $MAX_TRANSFER --cutoff-mode soft --transfers 4 --checkers 4 $extra" ; then
+        # empty source after a move = target fully drained (aged targets
+        # refill daily, so they are never watermarked)
+        if [ "$op" = move ] && [ "$aged" = 0 ] && ssh -o BatchMode=yes "$host" "[ -z \"\$(ls -A $(printf %q "$path") 2>/dev/null)\" ]"; then
             echo "$key" >> "$DONE_FILE"
             log "done $key — source empty, watermarked"
         else

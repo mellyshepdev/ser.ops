@@ -38,29 +38,30 @@ else
   log "WARN remote $REMOTE_HOST unreachable — staging locally at $LOCAL_DIR"
 fi
 
-# Staging lives on disk, not tmpfs: /tmp is RAM on this box and a single
-# multi-GB dump through it is how the 08:00 run died on 2026-09-20.
-STAGE_DIR="$HOME/backups/db/.staging"
-mkdir -p "$STAGE_DIR"
-
 # ship <archive-name> — reads a byte stream on stdin, gzip's it, lands it
-# on unit3 (or local fallback). One retry on transient ssh drops.
+# on unit3 (or local fallback when unit3 is down).
+#
+# Streamed, never staged. Dumps used to land whole in $HOME/backups/db/.staging
+# before the ssh copy, so every dump needed its full size free on this disk:
+# unit4's db task failed 16 runs straight (2026-10-11 .. 10-22) on "No space
+# left on device" while unit3 had 330 GB free. Now gzip pipes into ssh; the
+# remote writes .partial, checks it with gzip -t, then renames — a dropped
+# connection leaves a .partial, never a truncated "good" dump (same contract
+# as the cockroach path below). No in-run retry: stdin is gone once read, and
+# the next rotation re-dumps anyway. unit3's gdrive-offload moves aged dumps
+# on to the 5TB Drive (gdrive2:fleet-archive).
 ship(){
-  local name=$1 tmp ok=0 i
-  tmp=$(mktemp -p "$STAGE_DIR")
-  gzip -1 > "$tmp" || { rm -f "$tmp"; return 1; }
-  for i in 1 2; do
-    if [ $REMOTE_OK -eq 1 ]; then
-      cat "$tmp" | ssh $SSH_OPTS "$REMOTE_HOST" "cat > ~/$REMOTE_DIR/$name.gz" && ok=1
-    else
-      mv "$tmp" "$LOCAL_DIR/$name.gz" && ok=1; tmp=
-    fi
-    [ $ok -eq 1 ] && break
-    log "  retry $name (attempt $i failed)"
-    sleep 3
-  done
-  [ -n "$tmp" ] && rm -f "$tmp"
-  [ $ok -eq 1 ]
+  local name=$1 rp
+  if [ $REMOTE_OK -eq 1 ]; then
+    rp="~/$REMOTE_DIR/$name.gz"
+    gzip -1 | ssh $SSH_OPTS "$REMOTE_HOST" \
+      "cat > $rp.partial && gzip -t $rp.partial && mv $rp.partial $rp"
+  else
+    # unit3 down: straight to the local day dir (flushed up on a later run)
+    gzip -1 > "$LOCAL_DIR/$name.gz.partial" \
+      && mv "$LOCAL_DIR/$name.gz.partial" "$LOCAL_DIR/$name.gz" \
+      || { rm -f "$LOCAL_DIR/$name.gz.partial"; return 1; }
+  fi
 }
 
 # Events land in the dashboard's own journal — serops_web.py reads
