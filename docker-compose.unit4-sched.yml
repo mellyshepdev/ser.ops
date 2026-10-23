@@ -46,6 +46,43 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  # ser.ops2 — drain instance. Strictly capacity-critical jobs: unit3 -> 5TB
+  # offload, local staging sweep, and the 30d log-archive prune. Same image,
+  # same state dir (task names don't overlap with ser.ops1's table); it picks
+  # up conf/tasks.serops2.conf via UNIT_NAME.
+  ser-ops-drain:
+    image: ser.ops:latest
+    container_name: ser-ops-drain
+    restart: unless-stopped
+    init: true
+    user: "1006:1006"
+    group_add:
+      - "1001"
+    environment:
+      UNIT_NAME: "serops2"
+      REPO: /srv/ser.ops
+      STATE_DIR: /srv/ser.ops/state
+      ROTATE_DIR: /srv/ser.ops/state/rotate-serops2
+      LANES_DIR: /srv/ser.ops/state/lanes-serops2
+      SLOT_SECONDS: "${SLOT_SECONDS:-1800}"
+      TICK_SECONDS: "${TICK_SECONDS:-1800}"
+      HOME: /home/swoopg111
+    env_file:
+      - path: ./deploy/ser_ops.env
+        required: false
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/srv/ser.ops
+      - /home/swoopg111/backups-data:/home/swoopg111/backups
+      - /home/swoopg111/.ssh:/home/swoopg111/.ssh:ro
+      - /home/swoopg111/.pgpass:/home/swoopg111/.pgpass:ro
+    working_dir: /srv/ser.ops
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   # Locator device alerts -> email / Slack / Matrix, polled every minute.
   # Its own long-running service rather than a rotate.sh task: the scheduler
   # ticks every 30 min, far too slow for "this phone is about to die".

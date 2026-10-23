@@ -34,8 +34,10 @@ set -uo pipefail
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
 SCRIPTS="$REPO/scripts"
 STATE_DIR="${STATE_DIR:-$REPO/state}"
-ROTATE_DIR="$STATE_DIR/rotate"
-LANES_DIR="$STATE_DIR/lanes"
+# Two instances share STATE_DIR (one event stream for the dashboard) but must
+# not share the dispatch lock or lane accounting — ser.ops2 sets its own dirs.
+ROTATE_DIR="${ROTATE_DIR:-$STATE_DIR/rotate}"
+LANES_DIR="${LANES_DIR:-$STATE_DIR/lanes}"
 LOCKS_DIR="$STATE_DIR/locks"
 RUNLOG_DIR="$STATE_DIR/runlogs"
 UNIT="${UNIT_NAME:-$(hostname -s 2>/dev/null || echo unknown)}"
