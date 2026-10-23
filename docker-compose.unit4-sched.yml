@@ -27,8 +27,13 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/srv/ser.ops
-      - /home/swoopg111/backups:/home/swoopg111/backups
+      # ~/backups on the host is a symlink into the gdrive2 FUSE mount —
+      # docker cannot bind-mount a symlink (recreate fails "file exists"),
+      # and FUSE writes made every local-fallback/manifest op flaky. Real
+      # dir instead; sweep-backups pushes staged files to unit3.
+      - /home/swoopg111/backups-data:/home/swoopg111/backups
       - /home/swoopg111/.ssh:/home/swoopg111/.ssh:ro
+      - /home/swoopg111/.pgpass:/home/swoopg111/.pgpass:ro
     working_dir: /srv/ser.ops
     logging:
       driver: json-file

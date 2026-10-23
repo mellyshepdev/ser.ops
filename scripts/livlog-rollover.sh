@@ -171,6 +171,7 @@ drain_window() {
     psql_arch >/dev/null 2>&1 <<'SQL' || fail "could not prepare stage_archive on unit3"
 DROP TABLE IF EXISTS stage_archive;
 CREATE UNLOGGED TABLE stage_archive (
+    id BIGSERIAL,  -- arrival order: slices land chronological; merge concats on it
     unit TEXT, container TEXT, hour_bucket TIMESTAMPTZ,
     row_count INT, first_seen TIMESTAMPTZ, last_seen TIMESTAMPTZ, payload TEXT
 );
@@ -223,7 +224,13 @@ SQL
     # at the hour level rather than duplicating whole buckets.
     archived=$(psql_arch -tAc "
     INSERT INTO logs_archive (unit, container, hour_bucket, row_count, first_seen, last_seen, payload)
-    SELECT unit, container, hour_bucket, row_count, first_seen, last_seen, payload FROM stage_archive
+    -- collapse same-bucket slices first: one INSERT row per key, else PG
+    -- rejects ON CONFLICT with duplicate-key insert rows (2026-10-23).
+    SELECT unit, container, hour_bucket,
+           SUM(row_count), MIN(first_seen), MAX(last_seen),
+           string_agg(payload, E'\n' ORDER BY id)
+      FROM stage_archive
+     GROUP BY unit, container, hour_bucket
         ON CONFLICT (unit, container, hour_bucket) DO UPDATE
         SET payload   = logs_archive.payload || E'\n' || EXCLUDED.payload,
             row_count = logs_archive.row_count + EXCLUDED.row_count,
