@@ -30,7 +30,10 @@ UNITS=(
   "unit4|local"
   "unit2|ssh -o BatchMode=yes -o ConnectTimeout=8 unit2"
   "unit3|ssh -o BatchMode=yes -o ConnectTimeout=8 unit3"
+  "unit5|ssh -o BatchMode=yes -o ConnectTimeout=8 unit5"
   "unit6|ssh -o BatchMode=yes -o ConnectTimeout=8 unit6"
+  "unit11|ssh -o BatchMode=yes -o ConnectTimeout=8 unit11"
+  "unit13|ssh -o BatchMode=yes -o ConnectTimeout=8 unit13"
   "unit8|ssh -o BatchMode=yes -o ConnectTimeout=8 unit8"
   "unit9|ssh -o BatchMode=yes -o ConnectTimeout=8 root@unit9"
   "unit10|ssh -o BatchMode=yes -o ConnectTimeout=8 root@unit10|/etc/pve"
@@ -40,7 +43,7 @@ UNITS=(
 SEARCH_DIRS="projects server stacks compose-stacks"
 
 # Single-quoted so neither local nor remote shell glob-expands them.
-REMOTE_FIND='find DIR -type f \( -name "docker-compose*.yml" -o -name "docker-compose*.yaml" -o -name "*.env" -o -name "*.conf" -o -name "homeserver.yaml" -o -name "*.cfg" -o -name "postfix-accounts.cf" -o -name "*.yml" -o -name "*.yaml" \) -size -1048576c 2>/dev/null'
+REMOTE_FIND='find DIR -type d \( -name node_modules -o -name .git -o -name .next -o -name dist -o -name vendor \) -prune -o -type f \( -name "docker-compose*.yml" -o -name "docker-compose*.yaml" -o -name "*.env" -o -name "*.conf" -o -name "homeserver.yaml" -o -name "*.cfg" -o -name "postfix-accounts.cf" -o -name "*.yml" -o -name "*.yaml" \) -size -1048576c 2>/dev/null'
 
 sqlq() { printf "%s" "$1" | sed "s/'/''/g"; }
 

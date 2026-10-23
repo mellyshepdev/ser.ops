@@ -34,6 +34,11 @@ services:
       - /home/swoopg111/backups-data:/home/swoopg111/backups
       - /home/swoopg111/.ssh:/home/swoopg111/.ssh:ro
       - /home/swoopg111/.pgpass:/home/swoopg111/.pgpass:ro
+      # backup-configs.sh reads ~/projects ~/server for the "local" unit -
+      # without these mounts unit4's own configs were skipped entirely
+      # (last successful collection 2026-10-14).
+      - /home/swoopg111/projects:/home/swoopg111/projects:ro
+      - /home/swoopg111/server:/home/swoopg111/server:ro
     working_dir: /srv/ser.ops
     logging:
       driver: json-file
