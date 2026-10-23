@@ -83,6 +83,42 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  # ser.ops3 — snapshot lane. Owns fleet-wide vzdump of every prox guest
+  # (conf/tasks.serops3.conf) so snapshot runs never contend for the
+  # primary or drain lanes.
+  ser-ops-snap:
+    image: ser.ops:latest
+    container_name: ser-ops-snap
+    restart: unless-stopped
+    init: true
+    user: "1006:1006"
+    group_add:
+      - "1001"
+    environment:
+      UNIT_NAME: "serops3"
+      REPO: /srv/ser.ops
+      STATE_DIR: /srv/ser.ops/state
+      ROTATE_DIR: /srv/ser.ops/state/rotate-serops3
+      LANES_DIR: /srv/ser.ops/state/lanes-serops3
+      SLOT_SECONDS: "1800"
+      TICK_SECONDS: "1800"
+      HOME: /home/swoopg111
+    env_file:
+      - path: ./deploy/ser_ops.env
+        required: false
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/srv/ser.ops
+      - /home/swoopg111/backups-data:/home/swoopg111/backups
+      - /home/swoopg111/.ssh:/home/swoopg111/.ssh:ro
+      - /home/swoopg111/.pgpass:/home/swoopg111/.pgpass:ro
+    working_dir: /srv/ser.ops
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   # Locator device alerts -> email / Slack / Matrix, polled every minute.
   # Its own long-running service rather than a rotate.sh task: the scheduler
   # ticks every 30 min, far too slow for "this phone is about to die".
