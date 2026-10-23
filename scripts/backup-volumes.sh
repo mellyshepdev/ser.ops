@@ -198,7 +198,11 @@ mount_size_mb() {
 # Manifest: one line per attempted mount —
 #   container | mount-type | source | destination | archive | status
 # Restore without it is guesswork (the archive name hides the source path).
-MANIFEST_DIR="$BACKUP_DIR/$STAMP"
+# Manifest lives in STATE_DIR, not BACKUP_DIR: ~/backups is a symlink into
+# the gdrive2 FUSE mount, and a mount hiccup makes every manifest() append
+# fail ENOENT — the run ends rc=1, rotate retries it, and the heavy lane
+# stays busy for hours while db/db-remote/livlog starve (2026-10-23).
+MANIFEST_DIR="$STATE_DIR/volumes-manifests/$STAMP"
 MANIFEST="$MANIFEST_DIR/manifest-$STAMP-$TS.txt"
 mkdir -p "$MANIFEST_DIR"
 
